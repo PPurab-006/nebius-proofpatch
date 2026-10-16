@@ -7,49 +7,61 @@
 ## 1. Project Overview
 
 **ProofPatch** is an evidence-driven autonomous code-repair agent. Instead of speculative code patching, ProofPatch adheres to a strict scientific verification cycle:
-1. **Reproduce:** Synthesize an isolated regression test proving the bug exists and fails on the base commit.
-2. **Synthesize:** Query eligible **NVIDIA open-source models** (e.g., Nemotron) served via **Nebius AI Cloud / Token Factory** to propose targeted, minimal patches.
-3. **Verify:** Execute the test suite and regression tests inside an isolated sandbox.
+1. **Reproduce:** Clone into an isolated workspace and verify failure reproduction (tests or output).
+2. **Synthesize:** Query eligible **NVIDIA open-source models** (`nvidia/Llama-3.1-Nemotron-70B-Instruct`) served via **Nebius AI Cloud / Token Factory** to propose targeted, minimal patches.
+3. **Verify:** Apply the patch using strict uni-diff formatting and run testing inside the sandboxed space.
 4. **Certify:** Deliver only patches with empirical proof of defect resolution and zero regressions.
 
----
+## 2. Running ProofPatch Locally
 
-## 2. Competition Requirements & Preserved Constraints
+This MVP supports local evaluation and uses mock functionality if the Nebius API keys are unconfigured.
 
-> [!IMPORTANT]
-> **Implementation Status: Repository Setup Phase (Pre-Implementation)**  
-> This repository is in the initial setup phase. In strict accordance with competition setup constraints, no cloud infrastructure has been provisioned, no models downloaded, and zero cloud credits consumed.
+### Start Backend
 
-The following core hackathon requirements are preserved for future implementation:
-- **Nebius Infrastructure:** The application pipeline must run on Nebius AI Cloud infrastructure or utilize Nebius Token Factory endpoints.
-- **NVIDIA Open-Source Model:** Core code analysis and repair synthesis will utilize at least one eligible NVIDIA open-source model (such as NVIDIA Nemotron).
-- **Comprehensive Documentation:** Full technical disclosure of models, infrastructure topology, setup workflows, and evaluation results.
-- **Transparent Evaluation:** Systematic evaluation on bug benchmarks with honest reporting of successes, partial fixes, and failure modes.
+1. Navigate to backend: `cd backend`
+2. Install reqs: `pip install -r requirements.txt` (or via uv: `uv pip install -r requirements.txt`)
+3. Configure environment variables (copy `.env.example` to `.env`).
+4. Run server: `PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port 8000`
 
----
+### Start Frontend
 
-## 3. Strict Engineering & Anti-Fabrication Principles
+1. Navigate to frontend: `cd frontend`
+2. Install deps: `npm install`
+3. Run dev server: `npm run dev` (Vite dev runner on port 5173).
 
-- **Zero Fabricated Results:** No simulated benchmarks, false repair rates, or unverified claims.
-- **No Committed Secrets:** Nebius API tokens, NVIDIA NIM keys, and cloud credentials are strictly excluded via `.gitignore` and handled via secure environment variables.
-- **Autonomous Repository:** Completely decoupled repository with independent versioning, tests, and configuration.
+### Automated Runner
 
----
-
-## 4. Repository Structure
-
-```
-nebius-proofpatch/
-├── LICENSE                          # Apache-2.0 License
-├── README.md                        # Project documentation & status
-├── .gitignore                       # Environment, token, sandbox & build guards
-├── docs/                            # Competition requirements & architecture
-│   └── competition_requirements.md  # Preserved competition requirements
-└── tests/                           # Reproduction & patch verification test harness (planned)
+You can also run both services simultaneously using the root launcher:
+```bash
+./run.sh
 ```
 
+## 3. Supported Workflows and Sandbox
+
+ProofPatch accepts public/local Git repository URLs. For benchmarking, use the provided `benchmark_fixtures/`.
+
+**Security Sandbox Guarantees:**
+- **No Path Traversal:** Validates patch target paths strictly prevent relative (`../`) and absolute breakout.
+- **SSRF Protection:** Ingestion restricts clones to `http`, `https`, and (for local demo purposes only) `file`.
+- **Subprocess Isolation:** `WorkspaceManager` limits test runs to explicit allowed test commands (`pytest`, `python`, `python3`) and utilizes secure argument parsing with `shlex` and `shell=False` to explicitly prevent command shell injections (RCE).
+- **Stateless Workspaces:** Workspaces are cloned into randomized temp directories and scrubbed upon completion.
+
+## 4. Evaluation and Benchmarking
+
+Included in `benchmark_fixtures/`:
+- `simple_bug`: Validates basic Python AST-level patching (`math_utils.py` logic error). Reproduces failure under `pytest test_math_utils.py`, patches cleanly, and transitions from failure to verified fix.
+- `edge_case`: Validates model capability resolving boundary errors (`text_utils.py` off-by-one boundary truncation). Ensures proper status transition on unverified/failed repairs.
+
+*In live testing with Nebius Token Factory, `nvidia/Llama-3.1-Nemotron-70B-Instruct` is configured as the primary code diagnosis and repair model, with fallback mock verification when unconfigured.*
+
+## 5. Architectural Decisions
+
+- **Frontend:** React 19 + TypeScript + Vite + Tailwind CSS.
+- **Backend:** FastAPI + `gitpython` + `unidiff`.
+- **Model Gateway:** Nebius's OpenAI-compatible completions mapping targeting `nvidia/Llama-3.1-Nemotron-70B-Instruct`.
+
 ---
 
-## 5. License
+## License
 
-This project is licensed under the **Apache License 2.0** — see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **Apache License 2.0**.

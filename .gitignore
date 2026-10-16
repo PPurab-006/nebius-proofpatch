@@ -70,3 +70,11 @@ htmlcov/
 *~
 .DS_Store
 Thumbs.db
+
+# Logs & Node artifacts
+*.log
+node_modules/
+dist/
+
+# Benchmark fixture runtime git repositories
+benchmark_fixtures/*/.git/
