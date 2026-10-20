@@ -6,8 +6,44 @@ from git import Repo
 import logging
 import shlex
 from urllib.parse import urlparse
+import ipaddress
+import socket
+import zipfile
 
 logger = logging.getLogger(__name__)
+
+def is_safe_url(url: str) -> bool:
+    parsed = urlparse(url)
+
+    if parsed.username or parsed.password:
+        return False
+
+    if parsed.scheme == 'file':
+        return True # For benchmark fixtures
+
+    if parsed.scheme not in ['http', 'https']:
+        return False
+
+    try:
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        # Resolve hostname
+        ip_addr = socket.gethostbyname(hostname)
+        ip = ipaddress.ip_address(ip_addr)
+
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return False
+
+        # Check cloud metadata
+        if str(ip) == '169.254.169.254':
+            return False
+
+    except Exception:
+        return False # Fail safe
+
+    return True
 
 class WorkspaceManager:
     def __init__(self, base_dir=None):
@@ -15,13 +51,8 @@ class WorkspaceManager:
         self.workspaces = {}
 
     def create_workspace(self, repo_url: str) -> str:
-        # Validate URL to prevent SSRF and arbitrary local file access
-        parsed_url = urlparse(repo_url)
-        allowed_schemes = ['http', 'https']
-        # For the sake of the local hackathon demo/benchmarking, we allow 'file' temporarily
-        # but in a real prod scenario, we'd restrict it to git/http(s).
-        if parsed_url.scheme not in allowed_schemes and parsed_url.scheme != 'file':
-            raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
+        if not is_safe_url(repo_url):
+            raise ValueError(f"Unsafe or unsupported URL: {repo_url}")
             
         workspace_id = os.urandom(8).hex()
         workspace_path = os.path.join(self.base_dir, f"proofpatch_ws_{workspace_id}")
@@ -36,6 +67,51 @@ class WorkspaceManager:
             if os.path.exists(workspace_path):
                 shutil.rmtree(workspace_path)
             raise ValueError(f"Could not clone repository: {str(e)}")
+
+    def create_workspace_from_zip(self, zip_path: str) -> str:
+        workspace_id = os.urandom(8).hex()
+        workspace_path = os.path.join(self.base_dir, f"proofpatch_ws_{workspace_id}")
+        os.makedirs(workspace_path, exist_ok=True)
+
+        MAX_SIZE = 50 * 1024 * 1024 # 50MB
+        MAX_FILES = 500
+
+        try:
+            total_size = 0
+            file_count = 0
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for member in zip_ref.infolist():
+                    if member.is_dir():
+                        continue
+
+                    target_path = os.path.abspath(os.path.join(workspace_path, member.filename))
+                    if not target_path.startswith(os.path.abspath(workspace_path)):
+                        raise ValueError("Zip Slip vulnerability detected")
+
+                    total_size += member.file_size
+                    file_count += 1
+
+                    if total_size > MAX_SIZE:
+                        raise ValueError("Archive exceeds maximum allowed size (50MB)")
+                    if file_count > MAX_FILES:
+                        raise ValueError("Archive exceeds maximum allowed files (500)")
+
+                zip_ref.extractall(workspace_path)
+
+            # Initialize git repo to allow patching
+            repo = Repo.init(workspace_path)
+            with repo.config_writer() as cw:
+                cw.set_value("user", "name", "ProofPatch")
+                cw.set_value("user", "email", "bot@proofpatch.test")
+            repo.git.add(A=True)
+            repo.index.commit("Initial commit from ZIP upload")
+
+            self.workspaces[workspace_id] = workspace_path
+            return workspace_id
+        except Exception as e:
+            if os.path.exists(workspace_path):
+                shutil.rmtree(workspace_path)
+            raise ValueError(f"Failed to process ZIP upload: {str(e)}")
 
     def get_workspace_path(self, workspace_id: str) -> str:
         if workspace_id not in self.workspaces:
@@ -126,3 +202,17 @@ class WorkspaceManager:
                 "stderr": f"Error running tests: {str(e)}",
                 "returncode": -1
              }
+
+    def rollback_patch(self, workspace_id: str) -> bool:
+        workspace_path = self.get_workspace_path(workspace_id)
+        try:
+            subprocess.run(
+                ["git", "reset", "--hard", "HEAD"],
+                cwd=workspace_path,
+                check=True,
+                capture_output=True
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Rollback failed: {e.stderr}")
+            return False
