@@ -127,7 +127,12 @@ def redact_secrets(text: str) -> str:
     text = re.sub(r'-----BEGIN[A-Z\s]+PRIVATE KEY-----.*?-----END[A-Z\s]+PRIVATE KEY-----', '***REDACTED_PRIVATE_KEY***', text, flags=re.DOTALL)
     return text
 
-def build_context(ws_path: str, focus_files: Optional[List[str]] = None) -> str:
+def build_context(
+    ws_path: str,
+    focus_files: Optional[List[str]] = None,
+    evidence: Optional[str] = None,
+    line_numbers: Optional[List[int]] = None
+) -> str:
     code_context = ""
     # If focus files provided, prioritize them
     if focus_files:
@@ -136,10 +141,39 @@ def build_context(ws_path: str, focus_files: Optional[List[str]] = None) -> str:
             if os.path.isfile(target):
                 try:
                     with open(target, 'r', errors='ignore') as fh:
-                        content = fh.read()
-                        if len(content) > 8000:
-                            content = content[:8000] + "\n... [truncated]"
-                        code_context += f"--- {f} ---\n<untrusted_source_code>\n{redact_secrets(content)}\n</untrusted_source_code>\n\n"
+                        raw_content = fh.read()
+
+                    # Smart context slicing for large files
+                    if len(raw_content) > 8000:
+                        lines = raw_content.splitlines()
+                        target_line = None
+
+                        if line_numbers and len(line_numbers) > 0 and line_numbers[0] is not None:
+                            target_line = line_numbers[0]
+
+                        if target_line is None and evidence and evidence.strip():
+                            ev_clean = evidence.strip().splitlines()[0].strip()
+                            if len(ev_clean) >= 6:
+                                for l_idx, l_val in enumerate(lines):
+                                    if ev_clean in l_val:
+                                        target_line = l_idx + 1
+                                        break
+
+                        if target_line is not None and 1 <= target_line <= len(lines):
+                            start_l = max(0, target_line - 55)
+                            end_l = min(len(lines), target_line + 65)
+                            sliced_content = "\n".join(lines[start_l:end_l])
+                            content = (
+                                f"... [lines 1-{start_l} omitted for scope] ...\n"
+                                f"{sliced_content}\n"
+                                f"... [lines {end_l+1}-{len(lines)} omitted for scope] ..."
+                            )
+                        else:
+                            content = raw_content[:10000] + "\n... [truncated]"
+                    else:
+                        content = raw_content
+
+                    code_context += f"--- {f} ---\n<untrusted_source_code>\n{redact_secrets(content)}\n</untrusted_source_code>\n\n"
                 except Exception:
                     pass
         if len(code_context) > 100:
@@ -483,7 +517,16 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
             if not focus_files and request.diagnosis_context.get("fault_file"):
                 focus_files = [request.diagnosis_context.get("fault_file")]
 
-        code_context = build_context(ws_path, focus_files=focus_files)
+        ev_ctx = None
+        ln_ctx = None
+        if request.selected_finding:
+            ev_ctx = request.selected_finding.get("evidence")
+            ln_ctx = request.selected_finding.get("line_numbers")
+        elif request.diagnosis_context:
+            ev_ctx = request.diagnosis_context.get("evidence")
+            ln_ctx = request.diagnosis_context.get("line_numbers")
+
+        code_context = build_context(ws_path, focus_files=focus_files, evidence=ev_ctx, line_numbers=ln_ctx)
 
         try:
             patch = nebius_client.generate_patch(request.diagnosis_context, code_context)
@@ -1320,7 +1363,12 @@ def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends
 
         # Build fresh code context (takes into account previous successful repairs)
         focus_files = files if files else ([fault_file] if fault_file else None)
-        code_ctx = build_context(ws_path, focus_files=focus_files)
+        code_ctx = build_context(
+            ws_path,
+            focus_files=focus_files,
+            evidence=finding.get("evidence"),
+            line_numbers=finding.get("line_numbers")
+        )
 
         # Generate patch
         try:

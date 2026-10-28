@@ -386,7 +386,15 @@ class WorkspaceManager:
         elif base_cmd == "pytest":
             try:
                 import pytest  # noqa: F401
-                exec_args = [sys.executable, "-m", "pytest"] + list(cmd_args[1:])
+                # Disable conflicting external plugins (e.g. ROS launch_testing) and suppress warning clutter
+                exec_args = [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-p",
+                    "no:launch_testing",
+                    "--disable-warnings"
+                ] + list(cmd_args[1:])
             except ImportError:
                 return {
                     "success": False,
@@ -403,6 +411,7 @@ class WorkspaceManager:
         env["PYTHONPATH"] = workspace_path
         env["PYTHONNOUSERSITE"] = "1"
 
+        test_timeout = int(os.getenv("TEST_TIMEOUT", "60"))
         try:
             # We explicitly use shell=False and pass the array of arguments to prevent injection
             result = subprocess.run(
@@ -412,7 +421,7 @@ class WorkspaceManager:
                 shell=False,
                 capture_output=True,
                 text=True,
-                timeout=30 # Enforce timeout
+                timeout=test_timeout
             )
             return {
                 "success": result.returncode == 0,
@@ -424,7 +433,7 @@ class WorkspaceManager:
              return {
                 "success": False,
                 "stdout": "",
-                "stderr": "Test execution timed out after 30 seconds",
+                "stderr": f"Test execution timed out after {test_timeout} seconds",
                 "returncode": -1
              }
         except Exception as e:
