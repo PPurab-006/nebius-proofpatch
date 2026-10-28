@@ -2457,14 +2457,28 @@ ${
                               </button>
                             </div>
                           )
+                        ) : repair.verification_status === 'UNVERIFIED' ? (
+                          <div className="p-3 bg-[#F4BF50]/10 border border-[#F4BF50]/30 rounded text-xs font-mono text-[#F4BF50] space-y-1.5">
+                            <div className="flex items-center gap-1.5 font-bold">
+                              <AlertTriangle className="w-4 h-4 text-[#F4BF50]" />
+                              <span>Truthful Verification Gate: Fix is UNVERIFIED</span>
+                            </div>
+                            <p className="text-[11px] leading-relaxed text-[#969B90]">
+                              The patch applied cleanly to the sandbox, but <strong className="text-[#F4F5F0]">no verification test command</strong> was executed. Patchworks strictly requires empirical test proof (exit code 0) before opening automated PRs to prevent untested code regressions.
+                            </p>
+                            <div className="text-[11px] text-[#969B90] pt-1 border-t border-[#242820]">
+                              <span className="text-[#B7FF3C]">To Certify & Unlock PR: </span>
+                              Enter an automated test command (e.g. <code className="text-[#D4FF8A]">npm test</code>, <code className="text-[#D4FF8A]">pytest</code>, or a build/lint script) in the <span className="text-[#F4F5F0]">Verification Test Command</span> input and click re-synthesize.
+                            </div>
+                          </div>
                         ) : (
                           <div className="p-3 bg-[#FF5C68]/10 border border-[#FF5C68]/30 rounded text-xs font-mono text-[#FF5C68] space-y-1">
                             <div className="flex items-center gap-1.5 font-bold">
                               <AlertTriangle className="w-4 h-4" />
-                              Publication Blocked: Fix Not Verified
+                              Publication Blocked: Fix Failed Tests
                             </div>
                             <p className="text-[11px] leading-relaxed text-[#969B90]">
-                              Verification status is <code className="text-[#FF5C68]">{repair.verification_status || 'UNVERIFIED'}</code>. Patchworks strictly enforces truthful verification: unverified patches cannot be automatically opened as pull requests. Review sandbox output and retry.
+                              Verification status is <code className="text-[#FF5C68]">{repair.verification_status}</code>. Patchworks strictly blocks pull requests for patches that fail test verification. Review sandbox output and failure diagnostics above.
                             </p>
                           </div>
                         )}
