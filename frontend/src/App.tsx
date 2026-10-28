@@ -161,6 +161,8 @@ interface RepairResponse {
   status: string;
   workspace_id?: string;
   message?: string;
+  failure_reason?: string;
+  error?: string;
   patch: string;
   patch_applied?: boolean;
   verification_status?: string;
@@ -2244,6 +2246,48 @@ ${
                     </div>
                   </div>
 
+                  {/* Failure Diagnostics & Root Cause Section */}
+                  {(repair.verification_status === 'APPLY FAILED' ||
+                    repair.verification_status === 'PATCH GENERATION FAILED' ||
+                    repair.verification_status === 'FIX FAILED' ||
+                    !repair.patch_applied ||
+                    repair.failure_reason) && (
+                    <div className="p-3.5 border-b border-[#242820] bg-[#160B0D] space-y-2">
+                      <div className="flex items-center justify-between text-xs font-mono">
+                        <div className="flex items-center gap-1.5 text-[#FF5C68] font-bold uppercase tracking-wider">
+                          <AlertCircle className="w-4 h-4 shrink-0" />
+                          <span>
+                            {repair.verification_status === 'APPLY FAILED' || !repair.patch_applied
+                              ? 'Patch Application Failed'
+                              : repair.verification_status === 'PATCH GENERATION FAILED'
+                              ? 'Patch Synthesis Failed'
+                              : 'Verification Test Failed'}
+                          </span>
+                        </div>
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[#FF5C68]/15 text-[#FF5C68] border border-[#FF5C68]/30 font-bold uppercase">
+                          {repair.verification_status || 'FAILED'}
+                        </span>
+                      </div>
+
+                      <div className="text-xs font-mono text-[#F4F5F0] bg-[#050505] p-3 rounded border border-[#FF5C68]/30 space-y-1.5">
+                        <div className="text-[#FF5C68] font-semibold leading-relaxed">
+                          <span className="text-[#969B90] font-normal uppercase text-[10px] block mb-0.5">Failure Reason:</span>
+                          {repair.failure_reason || repair.message || repair.error || (
+                            !repair.patch_applied
+                              ? 'The generated unified diff hunk headers or context lines could not be aligned against the target file.'
+                              : 'Sandbox tests reported non-zero exit code or failure assertions.'
+                          )}
+                        </div>
+                        <div className="text-[11px] text-[#969B90] pt-1.5 border-t border-[#242820]">
+                          <span className="text-[#D4FF8A] font-medium">Diagnostic Guidance: </span>
+                          {repair.verification_status === 'APPLY FAILED' || !repair.patch_applied
+                            ? 'Inspect the diff hunks below to check if line numbers or file structure in the repository have changed, or refine the problem description to provide more context.'
+                            : 'Review the Sandbox Test Execution Output below to inspect failing test names, stack traces, and exit codes.'}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Patch Body */}
                   <div className="bg-[#050505] p-4 overflow-x-auto font-mono text-xs max-h-80 border-b border-[#242820]">
                     {repair.patch ? (
@@ -2721,6 +2765,29 @@ ${
                               <span className="text-[#B7FF3C] font-semibold">Recommended Action: </span>
                               {finding.proposed_fix}
                             </div>
+
+                            {/* Inline Failure Notice for Currently Selected Finding */}
+                            {isSelected && repair && (repair.verification_status === 'APPLY FAILED' || repair.verification_status === 'FIX FAILED' || !repair.patch_applied) && (
+                              <div className="p-2.5 bg-[#FF5C68]/10 border border-[#FF5C68]/30 rounded text-xs font-mono space-y-1">
+                                <div className="flex items-center justify-between text-[#FF5C68] font-bold">
+                                  <div className="flex items-center gap-1.5">
+                                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                                    <span>
+                                      {repair.verification_status === 'APPLY FAILED' || !repair.patch_applied
+                                        ? 'Patch Application Failed'
+                                        : 'Test Verification Failed'}
+                                    </span>
+                                  </div>
+                                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-[#050505] text-[#FF5C68] border border-[#FF5C68]/40">
+                                    {repair.verification_status || 'FAILED'}
+                                  </span>
+                                </div>
+                                <div className="text-[11px] text-[#F4F5F0] leading-snug">
+                                  <span className="text-[#969B90]">Reason: </span>
+                                  {repair.failure_reason || repair.message || repair.error || 'The generated diff could not be applied cleanly or tests failed.'}
+                                </div>
+                              </div>
+                            )}
 
                             {!isEligible ? (
                               <div className="p-2.5 bg-[#11140F] border border-[#242820] rounded text-xs font-mono text-[#969B90] flex items-center justify-between">

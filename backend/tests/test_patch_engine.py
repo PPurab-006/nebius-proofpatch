@@ -237,5 +237,37 @@ def test_patch_engine_normalizes_repo_name_prefix():
 
         assert "VAL = 2" in content
 
+def test_apply_patch_detailed_provides_reasons():
+    """Verify that apply_patch_detailed returns actionable failure reasons."""
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'real line' > app.py && git add app.py && git commit -m 'Initial'")
+
+        # 1. Empty patch
+        ok, reason = PatchEngine.apply_patch_detailed(temp_repo, "")
+        assert ok is False
+        assert "empty" in reason.lower()
+
+        # 2. Path traversal security rejection
+        bad_patch = """--- a/../../secret.txt
++++ b/../../secret.txt
+@@ -1,1 +1,1 @@
+-old
++new
+"""
+        ok, reason = PatchEngine.apply_patch_detailed(temp_repo, bad_patch)
+        assert ok is False
+        assert "security rejection" in reason.lower()
+
+        # 3. Conflicting hunk context
+        conflict_patch = """--- a/app.py
++++ b/app.py
+@@ -1,1 +1,1 @@
+-nonexistent line that is not in the file
++new line
+"""
+        ok, reason = PatchEngine.apply_patch_detailed(temp_repo, conflict_patch)
+        assert ok is False
+        assert "git" in reason.lower() or "context" in reason.lower()
+
 
 

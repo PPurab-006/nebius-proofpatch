@@ -3,7 +3,7 @@ import re
 import difflib
 import subprocess
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 from unidiff import PatchSet
 
 logger = logging.getLogger(__name__)
@@ -195,10 +195,10 @@ def strip_leaked_json_artifacts(patch: str) -> str:
     return "\n".join(cleaned_lines) + "\n"
 
 class PatchEngine:
-    @staticmethod
-    def apply_patch(workspace_path: str, patch_content: str, target_file_hint: Optional[str] = None) -> bool:
+    @classmethod
+    def apply_patch_detailed(cls, workspace_path: str, patch_content: str, target_file_hint: Optional[str] = None) -> Tuple[bool, str]:
         if not patch_content or not patch_content.strip():
-            return False
+            return False, "Patch content is empty or contains no unified diff hunks."
 
         sanitized_patch = strip_leaked_json_artifacts(fix_hunk_headers(normalize_diff_indentation(patch_content)))
         sanitized_patch = normalize_patch_file_headers(workspace_path, sanitized_patch, target_file_hint=target_file_hint)
@@ -228,8 +228,9 @@ class PatchEngine:
                     target_files = [resolved_hint]
 
             if not target_files:
-                logger.warning("No target files identified in patch")
-                return False
+                reason = "No target source files could be identified from diff headers (e.g. +++ b/<path>) or hints."
+                logger.warning(reason)
+                return False, reason
 
             for raw_path in target_files:
                 clean_target = raw_path
@@ -239,19 +240,22 @@ class PatchEngine:
 
                 # Prevent absolute paths or path traversal
                 if target_path.startswith("..") or target_path.startswith("/") or target_path.startswith("\\"):
-                    logger.warning(f"Invalid path in patch: {target_path}")
-                    return False
+                    reason = f"Security rejection: Invalid path '{target_path}' contains path traversal or absolute references."
+                    logger.warning(reason)
+                    return False, reason
 
                 # Prevent changes outside workspace
                 abs_target = os.path.abspath(os.path.join(workspace_path, target_path))
                 if not abs_target.startswith(os.path.abspath(workspace_path)):
-                    logger.warning(f"Target path outside workspace: {target_path}")
-                    return False
+                    reason = f"Security rejection: Target path '{target_path}' resolves outside the workspace."
+                    logger.warning(reason)
+                    return False, reason
 
                 # Prevent modifying binary files implicitly by checking path
                 if any(target_path.endswith(ext) for ext in ['.exe', '.dll', '.so', '.pyc', '.zip', '.tar.gz']):
-                    logger.warning(f"Patching binary files is not allowed: {target_path}")
-                    return False
+                    reason = f"Security rejection: Patching binary file '{target_path}' is prohibited."
+                    logger.warning(reason)
+                    return False, reason
 
             # Primary: Standard git apply
             result = subprocess.run(
@@ -262,7 +266,7 @@ class PatchEngine:
             )
 
             if result.returncode == 0:
-                return True
+                return True, ""
 
             # Fallback 1: git apply with whitespace tolerance
             logger.info("Retrying git apply with whitespace tolerance")
@@ -274,7 +278,7 @@ class PatchEngine:
             )
 
             if result_whitespace.returncode == 0:
-                return True
+                return True, ""
 
             # Fallback 2: git apply with reduced context tolerance (C1 ensures at least 1 line matches)
             result_c1 = subprocess.run(
@@ -285,7 +289,7 @@ class PatchEngine:
             )
 
             if result_c1.returncode == 0:
-                return True
+                return True, ""
 
             # Fallback 3: git apply with 3way merge
             result_3way = subprocess.run(
@@ -296,7 +300,7 @@ class PatchEngine:
             )
 
             if result_3way.returncode == 0:
-                return True
+                return True, ""
 
             # Fallback 4: patch utility (handles line offsets and whitespace variations safely)
             result_patch_cmd = subprocess.run(
@@ -308,22 +312,50 @@ class PatchEngine:
 
             if result_patch_cmd.returncode == 0:
                 logger.info("Patch applied successfully via patch utility")
-                return True
+                return True, ""
 
             # Fallback 5: Semantic fuzzy chunk ingestion (handles LLM indentation drops and line miscalculations)
             logger.info("Retrying patch via semantic fuzzy chunk ingestion")
             if PatchEngine.fuzzy_apply_patch(workspace_path, sanitized_patch, target_file_hint=target_file_hint):
-                return True
+                return True, ""
 
-            logger.error(f"Failed to apply patch: {result.stderr or result_whitespace.stderr or result_patch_cmd.stderr}")
-            return False
+            # Extract informative diagnostic errors from subprocesses
+            stderr_candidates = [
+                result.stderr,
+                result_whitespace.stderr,
+                result_c1.stderr,
+                result_3way.stderr,
+                result_patch_cmd.stderr
+            ]
+            error_lines = []
+            for err in stderr_candidates:
+                if err and err.strip():
+                    for line in err.strip().splitlines():
+                        trimmed = line.strip()
+                        if trimmed and trimmed not in error_lines and not trimmed.startswith("warning:"):
+                            error_lines.append(trimmed)
+
+            if error_lines:
+                diagnostic = "; ".join(error_lines[:2])
+                reason = f"Git rejected patch due to conflicting hunks ({diagnostic}). File context lines do not match repository content."
+            else:
+                reason = "Git apply and patch utilities failed to locate matching context lines in target file."
+
+            logger.error(f"Failed to apply patch: {reason}")
+            return False, reason
 
         except Exception as e:
-            logger.error(f"Error applying patch: {e}")
-            return False
+            reason = f"Error applying patch to workspace: {str(e)}"
+            logger.error(reason)
+            return False, reason
         finally:
             if os.path.exists(patch_file_path):
                 os.remove(patch_file_path)
+
+    @classmethod
+    def apply_patch(cls, workspace_path: str, patch_content: str, target_file_hint: Optional[str] = None) -> bool:
+        applied, _ = cls.apply_patch_detailed(workspace_path, patch_content, target_file_hint=target_file_hint)
+        return applied
 
     @staticmethod
     def fuzzy_apply_patch(workspace_path: str, patch_content: str, target_file_hint: Optional[str] = None) -> bool:

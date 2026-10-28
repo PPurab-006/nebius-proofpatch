@@ -581,6 +581,32 @@ def resolve_targeted_test(workspace_path: str, fault_file: Optional[str]) -> Opt
 
     return None
 
+def extract_test_failure_summary(test_details: Optional[dict]) -> str:
+    """Extract a concise diagnostic summary from failed test execution."""
+    if not test_details:
+        return "Test execution details were not recorded."
+    returncode = test_details.get("returncode", 1)
+    if returncode == -1:
+        return test_details.get("stderr") or test_details.get("stdout") or "Test command timed out or test executable could not be executed."
+
+    stdout = test_details.get("stdout", "") or ""
+    stderr = test_details.get("stderr", "") or ""
+    combined = stdout + "\n" + stderr
+
+    failures = re.findall(r"(?:FAILED|ERROR)\s+([^\n]+)", combined)
+    if failures:
+        return f"Test failure: {'; '.join(failures[:3])}"
+
+    err_match = re.search(r"((?:AssertionError|SyntaxError|TypeError|ValueError|ImportError|NameError|AttributeError)[^\n]*)", combined)
+    if err_match:
+        return f"Runtime error: {err_match.group(1).strip()}"
+
+    summary_match = re.search(r"=+\s*([\d\w\s,]+failed[^\n=]*)=+", combined, re.IGNORECASE)
+    if summary_match:
+        return f"Test suite failed: {summary_match.group(1).strip()}"
+
+    return f"Tests exited with non-zero exit code ({returncode})."
+
 @app.post("/api/repair")
 def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
     ws_id = request.workspace_id
@@ -640,6 +666,7 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
         try:
             patch = nebius_client.generate_patch(request.diagnosis_context, code_context)
         except NebiusInferenceError as e:
+            reason = f"Nebius inference error: {str(e)}"
             workspace_manager.update_workspace_metadata(
                 ws_id,
                 {
@@ -647,37 +674,42 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
                     "diagnosis_context": request.diagnosis_context,
                     "verification_status": "PATCH GENERATION FAILED",
                     "patch_applied": False,
+                    "failure_reason": reason,
                     "error": str(e)
                 }
             )
             return {
                 "status": "error",
                 "message": str(e),
+                "failure_reason": reason,
                 "patch": "",
                 "patch_applied": False,
                 "verification_status": "PATCH GENERATION FAILED"
             }
 
         if not patch:
+            reason = "Nebius model returned an empty response or did not produce unified diff hunks."
             workspace_manager.update_workspace_metadata(
                 ws_id,
                 {
                     "issue_description": request.issue_description,
                     "diagnosis_context": request.diagnosis_context,
                     "verification_status": "PATCH GENERATION FAILED",
-                    "patch_applied": False
+                    "patch_applied": False,
+                    "failure_reason": reason
                 }
             )
             return {
                 "status": "error",
                 "message": "Patch generation unavailable or model returned no diff",
+                "failure_reason": reason,
                 "patch": "",
                 "patch_applied": False,
                 "verification_status": "PATCH GENERATION FAILED"
             }
 
         target_hint = focus_files[0] if (focus_files and len(focus_files) > 0) else None
-        applied = PatchEngine.apply_patch(ws_path, patch, target_file_hint=target_hint)
+        applied, apply_reason = PatchEngine.apply_patch_detailed(ws_path, patch, target_file_hint=target_hint)
         if not applied:
             workspace_manager.update_workspace_metadata(
                 ws_id,
@@ -686,12 +718,14 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
                     "diagnosis_context": request.diagnosis_context,
                     "patch": patch,
                     "verification_status": "APPLY FAILED",
+                    "failure_reason": apply_reason,
                     "patch_applied": False
                 }
             )
             return {
                 "status": "error", 
-                "message": "Failed to apply patch safely or unidiff validation failed",
+                "message": f"Failed to apply patch: {apply_reason}",
+                "failure_reason": apply_reason,
                 "patch": patch,
                 "patch_applied": False,
                 "verification_status": "APPLY FAILED"
@@ -699,6 +733,7 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
 
         verification_result = "UNVERIFIED"
         test_details = None
+        failure_reason = None
 
         # Resolve verification test command
         test_cmd = request.test_command
@@ -717,10 +752,13 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
             # returncode == -1 indicates execution failure (e.g. malformed command, disallowed base command, timeout, missing binary)
             if test_details.get("returncode") == -1:
                 verification_result = "VERIFICATION INCOMPLETE"
+                failure_reason = extract_test_failure_summary(test_details)
             elif test_details.get("success") is True and test_details.get("returncode") == 0:
                 verification_result = "FIX VERIFIED"
+                failure_reason = None
             else:
                 verification_result = "FIX FAILED"
+                failure_reason = extract_test_failure_summary(test_details)
 
         metadata_update = {
             "issue_description": request.issue_description,
@@ -729,6 +767,7 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
             "patch_applied": True,
             "verification_status": verification_result,
             "verification_details": test_details,
+            "failure_reason": failure_reason,
             "user_id": user.id if user else None
         }
         if request.selected_finding:
@@ -750,7 +789,8 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
                     "findings": meta.get("findings", []),
                     "patch": patch,
                     "verification_status": verification_result,
-                    "verification_details": test_details or {}
+                    "verification_details": test_details or {},
+                    "failure_reason": failure_reason
                 }
             )
 
@@ -760,7 +800,8 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
             "patch": patch,
             "patch_applied": True,
             "verification_status": verification_result,
-            "verification_details": test_details
+            "verification_details": test_details,
+            "failure_reason": failure_reason
         }
     except HTTPException:
         if is_new_workspace and ws_id:
@@ -1518,7 +1559,7 @@ def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends
             continue
 
         # Safely apply patch
-        applied = PatchEngine.apply_patch(ws_path, patch, target_file_hint=fault_file)
+        applied, apply_reason = PatchEngine.apply_patch_detailed(ws_path, patch, target_file_hint=fault_file)
         if not applied:
             repo.git.reset("--hard", checkpoint_sha)
             repo.git.clean("-fd")
@@ -1527,7 +1568,8 @@ def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends
                 "title": title,
                 "status": "failed",
                 "verification_status": "APPLY FAILED",
-                "error": "Failed to apply patch cleanly or unidiff validation failed.",
+                "error": f"Failed to apply patch: {apply_reason}",
+                "failure_reason": apply_reason,
                 "patch": patch,
                 "test_details": None
             })
