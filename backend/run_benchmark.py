@@ -20,14 +20,13 @@ def wait_for_backend():
 
 def run_benchmark(fixture_name, issue_desc, test_cmd):
     print(f"\n{'='*50}\nRunning Benchmark: {fixture_name}\n{'='*50}")
-    repo_url = f"file://{os.path.abspath(os.path.join(os.path.dirname(__file__), '../benchmark_fixtures', fixture_name))}"
 
     start_time = time.time()
 
     print("1. Diagnosing issue...")
     try:
         diag_resp = requests.post(f"{BASE_URL}/api/diagnose", json={
-            "repo_url": repo_url,
+            "benchmark": fixture_name,
             "issue_description": issue_desc,
             "test_command": test_cmd
         })
@@ -70,9 +69,9 @@ if __name__ == "__main__":
     import subprocess
     import sys
 
-    # Start backend
+    # Start backend using active Python interpreter
     server_process = subprocess.Popen(
-        ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"],
+        [sys.executable, "-m", "uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"],
         env=dict(os.environ, PYTHONPATH=os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     )
 

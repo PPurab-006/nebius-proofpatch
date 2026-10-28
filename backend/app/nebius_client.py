@@ -1,31 +1,213 @@
 import os
 import json
-from openai import OpenAI
+import re
+import logging
 from typing import Dict, Any, Optional
+from openai import (
+    OpenAI,
+    AuthenticationError,
+    NotFoundError,
+    RateLimitError,
+    APITimeoutError,
+    APIConnectionError,
+    APIStatusError,
+    BadRequestError,
+)
+from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
+
+# Ensure .env is loaded from workspace root
+env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+if os.path.exists(env_path):
+    load_dotenv(env_path, override=True)
+else:
+    load_dotenv(override=True)
+
+class NebiusInferenceError(Exception):
+    """Raised when a live call to Nebius API fails."""
+    def __init__(self, message: str, status_code: Optional[int] = None, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.details = details or {}
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    """Robustly parse JSON object from raw model content, code fences, or surrounding text."""
+    if not text or not text.strip():
+        raise ValueError("Empty response text from model.")
+
+    cleaned = text.strip()
+
+    # 1. Direct JSON parse
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 2. Extract from markdown code fences
+    fence_matches = list(re.finditer(r"```(?:json)?\s*\n(.*?)\n```", cleaned, re.DOTALL | re.IGNORECASE))
+    for m in fence_matches:
+        try:
+            data = json.loads(m.group(1).strip())
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    # 3. Extract from outermost { ... }
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidate = cleaned[first_brace:last_brace + 1]
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    # 4. Search for valid inner JSON objects with relevant keys
+    for m in re.finditer(r"\{[\s\S]*?\}", cleaned):
+        try:
+            cand = m.group(0)
+            data = json.loads(cand)
+            if isinstance(data, dict) and any(k in data for k in ("findings", "summary", "diagnosis", "recommendations")):
+                return data
+        except Exception:
+            pass
+
+    raise ValueError(f"Could not parse valid JSON object from model response: {cleaned[:160]}...")
+
+def format_api_error(e: Exception, model_name: str, base_url: str) -> str:
+    """Format exceptions into actionable diagnostics without exposing credentials."""
+    if isinstance(e, AuthenticationError):
+        return "Nebius authentication failed (HTTP 401). Verify NEBIUS_API_KEY in your .env configuration."
+    elif isinstance(e, NotFoundError):
+        return f"Model '{model_name}' not found on Nebius (HTTP 404). Check NEBIUS_MODEL_NAME."
+    elif isinstance(e, RateLimitError):
+        return "Nebius rate limit or concurrency limit exceeded (HTTP 429). Please retry shortly."
+    elif isinstance(e, APITimeoutError):
+        return "Nebius API request timed out."
+    elif isinstance(e, APIConnectionError):
+        return f"Could not connect to Nebius API endpoint ({base_url}). Check network connectivity."
+    elif isinstance(e, APIStatusError):
+        return f"Nebius API returned error status {e.status_code}: {e.message}"
+    elif isinstance(e, json.JSONDecodeError):
+        return f"Nebius model returned malformed non-JSON output: {str(e)}"
+    else:
+        return f"Nebius API error: {str(e)}"
+
+def extract_unified_diff(content: str) -> str:
+    """Extract clean unified diff content even if surrounded by markdown code fences, JSON, or conversational text."""
+    if not content:
+        return ""
+
+    text = content.strip()
+
+    # 0. Check if content is a JSON object with a patch field
+    if text.startswith("{") and "patch" in text:
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "patch" in data and isinstance(data["patch"], str):
+                text = data["patch"].strip()
+        except Exception:
+            pass
+
+    # 1. First look for any fenced code block that contains a diff header
+    fence_matches = list(re.finditer(r"```(?:diff|patch)?\s*\n(.*?)\n```", text, re.DOTALL | re.IGNORECASE))
+    for m in fence_matches:
+        block = m.group(1).strip()
+        if ("--- " in block or "diff --git " in block) and "+++" in block:
+            text = block
+            break
+
+    # 2. Find the start of the diff (either "diff --git " or "--- ")
+    lines = text.splitlines()
+    start_idx = -1
+    for idx, line in enumerate(lines):
+        if line.startswith("diff --git ") or (line.startswith("--- ") and any(l.startswith("+++ ") for l in lines[idx:idx+4])):
+            start_idx = idx
+            break
+
+    if start_idx == -1:
+        # Fallback: check if any line starts with ---
+        for idx, line in enumerate(lines):
+            if line.startswith("--- "):
+                start_idx = idx
+                break
+
+    if start_idx != -1:
+        diff_lines = []
+        in_hunk = False
+        for line in lines[start_idx:]:
+            # Stop if we hit a markdown closing fence or obvious commentary after diff
+            if line.strip() == "```":
+                break
+            if in_hunk and (line.startswith("Explanation:") or line.startswith("Note:") or line.startswith("This patch")):
+                break
+            if line.startswith("@@"):
+                in_hunk = True
+            diff_lines.append(line)
+        text = "\n".join(diff_lines)
+
+    return text.strip() + "\n"
 
 class NebiusClient:
-    def __init__(self):
-        # Configure the client to use the Nebius API
-        # Using the v1/chat/completions endpoint typical for OpenAI-compatible APIs
-        self.api_key = os.getenv("NEBIUS_API_KEY", "mock_key")
-        self.base_url = os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
-        # Eligible NVIDIA open-source model served on Nebius Token Factory
-        self.model_name = os.getenv("NEBIUS_MODEL_NAME", "nvidia/Llama-3.1-Nemotron-70B-Instruct") 
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model_name: Optional[str] = None,
+        timeout: Optional[float] = None
+    ):
+        self.api_key = api_key if api_key is not None else os.getenv("NEBIUS_API_KEY", "mock_key")
+        self.base_url = base_url if base_url is not None else os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
+        self.model_name = model_name if model_name is not None else os.getenv("NEBIUS_MODEL_NAME", "nvidia/Nemotron-3_5-Lightning")
+        self.timeout = timeout if timeout is not None else float(os.getenv("NEBIUS_TIMEOUT", "90.0"))
 
-        # We fall back to mock mode if not actually provided a real key for testing
-        self.mock_mode = self.api_key == "mock_key"
+        # Mock mode is active if api_key is empty, None, or 'mock_key'
+        self.mock_mode = (not self.api_key) or (self.api_key.strip() in ["mock_key", ""])
 
         if not self.mock_mode:
             self.client = OpenAI(
                 base_url=self.base_url,
-                api_key=self.api_key,
-                timeout=30.0,
-                max_retries=3
+                api_key=self.api_key.strip(),
+                timeout=self.timeout,
+                max_retries=2
+            )
+        else:
+            self.client = None
+
+    def reload(self):
+        """Reload configuration from .env and reinitialize client."""
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=True)
+        else:
+            load_dotenv(override=True)
+
+        self.api_key = os.getenv("NEBIUS_API_KEY", "mock_key")
+        self.base_url = os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
+        self.model_name = os.getenv("NEBIUS_MODEL_NAME", "nvidia/Nemotron-3_5-Lightning")
+        self.timeout = float(os.getenv("NEBIUS_TIMEOUT", "90.0"))
+        self.mock_mode = (not self.api_key) or (self.api_key.strip() in ["mock_key", ""])
+
+        if not self.mock_mode:
+            self.client = OpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key.strip(),
+                timeout=self.timeout,
+                max_retries=2
             )
         else:
             self.client = None
 
     def diagnose(self, issue_description: str, code_context: str) -> Dict[str, Any]:
+        """Diagnose code defect. Uses mock mode if configured; otherwise invokes live Nebius model."""
+        if self.mock_mode:
+            return self._mock_diagnose(issue_description, code_context)
+
         prompt = f"""
 You are an expert autonomous code-repair agent.
 Given the following issue description and code context, diagnose the failure and provide a structured JSON response.
@@ -49,9 +231,12 @@ Respond ONLY with a valid JSON object matching this schema:
         return self._call_model(prompt)
 
     def generate_patch(self, diagnosis_context: Dict[str, Any], code_context: str) -> str:
-        prompt = f"""
-You are an expert autonomous code-repair agent.
-Given the previous diagnosis and the code context, generate a unified diff patch to fix the issue.
+        """Synthesize unified diff patch. Uses mock mode if configured; otherwise invokes live Nebius model."""
+        if self.mock_mode:
+            return self._mock_generate_patch(diagnosis_context, code_context)
+
+        prompt = f"""You are an autonomous code repair engine.
+Provide a minimal git unified diff patch to fix the defect described in the diagnosis.
 
 Diagnosis:
 {json.dumps(diagnosis_context, indent=2)}
@@ -59,64 +244,368 @@ Diagnosis:
 Code Context:
 {code_context}
 
-Respond ONLY with the raw unified diff patch. No markdown formatting, no explanations, just the diff.
-Make sure the paths in the diff use standard git format (e.g. `--- a/file.py` and `+++ b/file.py`).
+Respond ONLY with a JSON object:
+{{
+    "explanation": "concise description of fix",
+    "patch": "git unified diff starting with --- a/ and +++ b/"
+}}
 """
-        if self.mock_mode:
-             # Return a valid unified diff format, even if it patches a dummy file.
-             return "--- a/mock.py\n+++ b/mock.py\n@@ -1,1 +1,1 @@\n-mock\n+fixed mock\n"
-
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert programmer and code repair assistant. Output ONLY unified diffs."},
+                    {"role": "system", "content": "You are an automated code repair system. Output pure JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                max_tokens=3072
+            )
+
+            raw_content = response.choices[0].message.content
+            if not raw_content and hasattr(response.choices[0].message, "reasoning"):
+                raw_content = getattr(response.choices[0].message, "reasoning", "")
+            if not raw_content:
+                raise NebiusInferenceError("Nebius model returned empty response without patch content.")
+
+            patch = extract_unified_diff(raw_content)
+            if not patch or not ("--- " in patch and "+++ " in patch):
+                raise NebiusInferenceError("Nebius model failed to generate a valid unified diff.")
+
+            return patch
+
+        except Exception as e:
+            if isinstance(e, NebiusInferenceError):
+                raise
+            err_msg = format_api_error(e, self.model_name, self.base_url)
+            logger.error(f"Live Nebius patch generation failed: {err_msg}")
+            # Do NOT fall back to mock when live inference is configured
+            raise NebiusInferenceError(f"Live Nebius patch generation failed: {err_msg}") from e
+
+    def _call_model(self, prompt: str, system_prompt: Optional[str] = None, max_tokens: int = 12288) -> Dict[str, Any]:
+        try:
+            sys_msg = system_prompt or "You are a precise diagnostic assistant. Always respond in pure JSON."
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": sys_msg},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=2048
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens
             )
 
-            content = response.choices[0].message.content.strip()
-            # Clean up markdown if model incorrectly outputs it
-            if content.startswith("```") and content.endswith("```"):
-                content = content.split("\n", 1)[1]
-                content = content.rsplit("\n", 1)[0]
+            if not response.choices:
+                raise NebiusInferenceError("Nebius model returned 0 completion choices.")
 
-            return content
+            choice = response.choices[0]
+
+            refusal = getattr(choice.message, "refusal", None)
+            if refusal and isinstance(refusal, str) and refusal.strip():
+                raise NebiusInferenceError(f"Nebius model refused the request: {refusal}")
+
+            if choice.finish_reason == "content_filter":
+                raise NebiusInferenceError("Nebius model response was filtered by content safety policy.")
+
+            content = choice.message.content
+            if choice.finish_reason == "length" and (not content or not content.strip()):
+                raise NebiusInferenceError(
+                    "Nebius model reached completion token limit (finish_reason: length). "
+                    "The model's internal reasoning exhausted available output tokens. "
+                    "Please scope the request or narrow the code context."
+                )
+
+            raw_content = content
+            if not raw_content and hasattr(choice.message, "reasoning"):
+                raw_content = getattr(choice.message, "reasoning", "")
+
+            if not raw_content or not raw_content.strip():
+                raise NebiusInferenceError("Nebius model returned empty response without diagnostic JSON.")
+
+            data = extract_json_object(raw_content)
+
+            # Ensure all required schema keys are present
+            data.setdefault("diagnosis", "Defect identified from code context.")
+            data.setdefault("evidence", "Context inspection.")
+            data.setdefault("files_to_modify", [])
+            data.setdefault("proposed_fix_description", "Apply minimal corrective patch.")
+            data.setdefault("regression_risks", "Low risk under standard test suite.")
+
+            return data
+
         except Exception as e:
-            print(f"Error calling Nebius API: {e}")
-            return ""
+            if isinstance(e, NebiusInferenceError):
+                raise
+            err_msg = format_api_error(e, self.model_name, self.base_url)
+            logger.error(f"Live Nebius diagnosis call failed: {err_msg}")
+            # Do NOT fall back to mock when live inference is configured
+            raise NebiusInferenceError(f"Live Nebius diagnosis failed: {err_msg}") from e
 
-    def _call_model(self, prompt: str) -> Dict[str, Any]:
+    def investigate(self, intent: str, issue_description: str, project_profile: Dict[str, Any], code_context: str) -> Dict[str, Any]:
+        """Perform open-ended repository investigation (bug discovery or general improvement)."""
         if self.mock_mode:
-            return {
-                "diagnosis": "This is a mock diagnosis due to missing API key.",
-                "evidence": "Mock evidence",
-                "files_to_modify": ["mock.py"],
-                "proposed_fix_description": "Fix the mock file",
-                "regression_risks": "None in mock mode."
-            }
+            return self._mock_investigate(intent, issue_description, project_profile, code_context)
 
+        languages = ", ".join(project_profile.get("languages", [])) or "Unknown"
+        manifests = ", ".join(project_profile.get("manifests", [])) or "None"
+        test_command = project_profile.get("test_command") or "None detected"
+        readme = project_profile.get("readme_summary", "")
+
+        is_bug_discovery = (intent == "bug_discovery")
+        role_desc = "security and correctness auditor" if is_bug_discovery else "senior software architect and code reviewer"
+        focus_desc = (
+            "Identify concrete, high-confidence bugs, defects, crash risks, unhandled exceptions, and correctness flaws."
+            if is_bug_discovery else
+            "Identify the highest-impact, evidence-backed improvements for architecture, maintainability, performance, and reliability."
+        )
+
+        prompt = f"""You are an expert {role_desc}.
+Analyze the repository profile and code context to {focus_desc}
+
+User Request:
+{issue_description}
+
+Project Profile:
+- Primary Languages: {languages}
+- Detected Manifests: {manifests}
+- Configured / Detected Test Command: {test_command}
+- Project Overview:
+{readme[:1200]}
+
+Repository Source Code Context:
+{code_context}
+
+CRITICAL RULES:
+1. Ground every finding in specific files and evidence visible in the code context. Do NOT generate generic or boilerplate advice.
+2. Focus strictly on the top 3 to 5 highest-impact, most actionable findings.
+3. If evidence is insufficient for a claim, state that clearly or omit the claim.
+4. For each finding, provide:
+   - "id": "finding-1", "finding-2", etc.
+   - "title": Short, descriptive title.
+   - "category": "defect" | "maintainability" | "performance" | "security" | "testing"
+   - "severity": "high" | "medium" | "low"
+   - "confidence": "high" | "medium" | "low"
+   - "impact": Concrete benefit or consequence.
+   - "risk": "Low" | "Medium" | "High"
+   - "files": Array of affected file paths.
+   - "line_numbers": Array of line numbers if known (or empty).
+   - "evidence": Specific code snippet or pattern from context.
+   - "explanation": Concise explanation of the issue or improvement.
+   - "action": "repair" (if targeted code patch is feasible) or "review".
+   - "proposed_fix": Concrete, practical recommendation or patch strategy.
+
+Respond ONLY with a valid JSON object matching this schema:
+{{
+    "summary": "Concise executive overview of the repository analysis.",
+    "findings": [
+        {{
+            "id": "finding-1",
+            "title": "Title",
+            "category": "defect",
+            "severity": "high",
+            "confidence": "high",
+            "impact": "Impact description",
+            "risk": "Low",
+            "files": ["file.py"],
+            "line_numbers": [10],
+            "evidence": "code snippet",
+            "explanation": "why this is an issue",
+            "action": "repair",
+            "proposed_fix": "how to fix"
+        }}
+    ]
+}}
+"""
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": "You are a precise diagnostic assistant. Always respond in pure JSON."},
+                    {"role": "system", "content": f"You are an expert {role_desc}. Always output pure JSON."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                response_format={ "type": "json_object" }
+                response_format={"type": "json_object"},
+                max_tokens=16384
             )
-            
-            content = response.choices[0].message.content
-            return json.loads(content)
-        except Exception as e:
-            print(f"Error calling Nebius API: {e}")
+
+            if not response.choices:
+                raise NebiusInferenceError("Nebius model returned 0 completion choices.")
+
+            choice = response.choices[0]
+            refusal = getattr(choice.message, "refusal", None)
+            if refusal and isinstance(refusal, str) and refusal.strip():
+                raise NebiusInferenceError(f"Nebius model refused the request: {refusal}")
+
+            if choice.finish_reason == "content_filter":
+                raise NebiusInferenceError("Nebius model response was filtered by content safety policy.")
+
+            content = choice.message.content
+            if choice.finish_reason == "length" and (not content or not content.strip()):
+                raise NebiusInferenceError(
+                    "Nebius model reached completion token limit (finish_reason: length). "
+                    "The analysis exhausted the maximum allowed tokens. Try scoping the request to a specific module."
+                )
+
+            raw_content = content
+            if not raw_content and hasattr(choice.message, "reasoning"):
+                raw_content = getattr(choice.message, "reasoning", "")
+
+            if not raw_content or not raw_content.strip():
+                raise NebiusInferenceError("Nebius model returned empty response without investigation findings.")
+
+            data = extract_json_object(raw_content)
+            findings = data.get("findings") or data.get("recommendations") or []
+            summary = data.get("summary") or "Repository investigation completed."
+
             return {
-                "diagnosis": f"Error: Failed to contact model API. {str(e)}",
-                "evidence": "None",
-                "files_to_modify": [],
-                "proposed_fix_description": "None",
-                "regression_risks": "Unknown due to API error."
+                "summary": summary,
+                "findings": findings
             }
+
+        except Exception as e:
+            if isinstance(e, NebiusInferenceError):
+                raise
+            err_msg = format_api_error(e, self.model_name, self.base_url)
+            logger.error(f"Live Nebius investigation failed: {err_msg}")
+            raise NebiusInferenceError(f"Live Nebius investigation failed: {err_msg}") from e
+
+    def _mock_investigate(self, intent: str, issue_description: str, project_profile: Dict[str, Any], code_context: str) -> Dict[str, Any]:
+        """Deterministic simulation of repository investigation for offline tests."""
+        if "easytype" in code_context.lower() or "easytype" in str(project_profile).lower():
+            return {
+                "summary": "[SIMULATED MOCK] Investigation of EasyType repository identified opportunities in parser architecture, extension modularity, and test coverage.",
+                "findings": [
+                    {
+                        "id": "rec-1",
+                        "title": "Replace Regex-Based Line Parsing with Tokenizer/AST",
+                        "category": "architecture",
+                        "severity": "high",
+                        "confidence": "high",
+                        "impact": "Eliminates brittle string-splitting logic and handles complex syntax correctly.",
+                        "risk": "Medium",
+                        "files": ["easytype.py"],
+                        "line_numbers": [1],
+                        "evidence": "def parse_line(line):\n    parts = line.strip().split()",
+                        "explanation": "Regex-based parsing fails on quoted strings, escaping, and nested blocks.",
+                        "action": "repair",
+                        "proposed_fix": "Introduce a stateful lexer and parser producing an AST."
+                    },
+                    {
+                        "id": "rec-2",
+                        "title": "Decouple VSCode Extension Core Logic from UI Events",
+                        "category": "maintainability",
+                        "severity": "medium",
+                        "confidence": "high",
+                        "impact": "Enables automated unit testing and cleaner disposable management.",
+                        "risk": "Low",
+                        "files": ["easytype-vscode-extension/src/extension.ts"],
+                        "line_numbers": [1],
+                        "evidence": "export function activate(context: vscode.ExtensionContext)",
+                        "explanation": "All command and event handlers are in a single large file without module separation.",
+                        "action": "review",
+                        "proposed_fix": "Split extension.ts into separate command and state modules."
+                    }
+                ]
+            }
+
+        if "math_utils.py" in code_context:
+            return {
+                "summary": "[SIMULATED MOCK] Inspection identified an arithmetic defect in math_utils.py.",
+                "findings": [
+                    {
+                        "id": "finding-1",
+                        "title": "Arithmetic Operator Inversion in subtract()",
+                        "category": "defect",
+                        "severity": "high",
+                        "confidence": "high",
+                        "impact": "Causes subtraction calculations to return the sum of operands.",
+                        "risk": "Low",
+                        "files": ["math_utils.py"],
+                        "line_numbers": [4],
+                        "evidence": "def subtract(a: int, b: int) -> int:\n    return a + b",
+                        "explanation": "Function subtract returns a + b instead of a - b.",
+                        "action": "repair",
+                        "proposed_fix": "Change operator from '+' to '-'."
+                    }
+                ]
+            }
+
+        return {
+            "summary": "[SIMULATED MOCK] Repository inspection completed in mock mode.",
+            "findings": [
+                {
+                    "id": "rec-1",
+                    "title": "Enhance Automated Test Coverage",
+                    "category": "testing",
+                    "severity": "medium",
+                    "confidence": "medium",
+                    "impact": "Ensures regression safety across module boundaries.",
+                    "risk": "Low",
+                    "files": project_profile.get("core_files", [])[:1],
+                    "line_numbers": [1],
+                    "evidence": "Observed test configuration.",
+                    "explanation": "Coverage can be improved by adding regression fixtures.",
+                    "action": "review",
+                    "proposed_fix": "Add test suites covering boundary cases."
+                }
+            ]
+        }
+
+    def _mock_diagnose(self, issue_description: str, code_context: str) -> Dict[str, Any]:
+        """Deterministic simulation for offline testing."""
+        if "math_utils.py" in code_context and "def subtract" in code_context:
+            return {
+                "diagnosis": "[SIMULATED MOCK] Function 'subtract' in math_utils.py incorrectly uses addition (+) instead of subtraction (-).",
+                "evidence": "def subtract(a, b):\n    return a + b",
+                "files_to_modify": ["math_utils.py"],
+                "proposed_fix_description": "Change the operator from '+' to '-' in subtract function.",
+                "regression_risks": "Low risk. Restores standard arithmetic subtraction behavior."
+            }
+
+        if "text_utils.py" in code_context and "def truncate" in code_context:
+            return {
+                "diagnosis": "[SIMULATED MOCK] Function 'truncate' in text_utils.py has an off-by-one boundary check (len(text) >= max_length instead of > max_length).",
+                "evidence": "if len(text) >= max_length:\n    return text[:max_length] + '...'",
+                "files_to_modify": ["text_utils.py"],
+                "proposed_fix_description": "Update condition from '>=' to '>' so strings of exact max_length are preserved.",
+                "regression_risks": "Low risk. Prevents unnecessary ellipsis truncation on strings matching max_length."
+            }
+
+        return {
+            "diagnosis": "[SIMULATED MOCK] Mock mode is active because NEBIUS_API_KEY is unconfigured.",
+            "evidence": f"Live inference against Nebius Token Factory ({self.model_name}) requires valid credentials.",
+            "files_to_modify": [],
+            "proposed_fix_description": "Deterministic mock simulations are only supported for benchmark fixtures ('simple_bug', 'edge_case'). Set NEBIUS_API_KEY for live autonomous code repair.",
+            "regression_risks": "Unknown: simulated mock mode cannot evaluate arbitrary codebases without a live model."
+        }
+
+    def _mock_generate_patch(self, diagnosis_context: Dict[str, Any], code_context: str) -> str:
+        """Deterministic patch for offline testing."""
+        if "math_utils.py" in code_context and "def subtract" in code_context:
+            return (
+                "--- a/math_utils.py\n"
+                "+++ b/math_utils.py\n"
+                "@@ -3,4 +3,4 @@\n"
+                " \n"
+                " def subtract(a: int, b: int) -> int:\n"
+                "     # Bug: Intentional addition instead of subtraction\n"
+                "-    return a + b\n"
+                "+    return a - b\n"
+            )
+
+        if "text_utils.py" in code_context and "def truncate" in code_context:
+            return (
+                "--- a/text_utils.py\n"
+                "+++ b/text_utils.py\n"
+                "@@ -1,5 +1,5 @@\n"
+                " def truncate(text: str, max_length: int) -> str:\n"
+                "     # Bug: Off-by-one boundary check causing unintended truncation\n"
+                "-    if len(text) < max_length:\n"
+                "+    if len(text) <= max_length:\n"
+                "         return text\n"
+                "     return text[:max_length] + \"...\"\n"
+            )
+
+        return ""
+

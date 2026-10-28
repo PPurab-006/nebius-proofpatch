@@ -1,12 +1,84 @@
 @import "tailwindcss";
 
+:root {
+  --bg-canvas: #050505;
+  --bg-panel: #0B0D0A;
+  --bg-surface: #11140F;
+  --border-subtle: #242820;
+  --accent-lime: #B7FF3C;
+  --accent-lime-subtle: #D4FF8A;
+  --text-primary: #F4F5F0;
+  --text-secondary: #969B90;
+  --status-error: #FF5C68;
+  --status-warning: #F4BF50;
+}
+
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: #0f172a;
-  color: #f8fafc;
+  background-color: #050505;
+  color: #F4F5F0;
+}
+
+code, pre, kbd, samp {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* Subtle engineering graph paper texture */
+.engineering-grid {
+  background-size: 24px 24px;
+  background-image: 
+    linear-gradient(to right, rgba(36, 40, 32, 0.35) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(36, 40, 32, 0.35) 1px, transparent 1px);
+}
+
+.subtle-dots {
+  background-image: radial-gradient(rgba(183, 255, 60, 0.1) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+/* Restrained lime action glow */
+.glow-lime {
+  box-shadow: 0 0 18px rgba(183, 255, 60, 0.18);
+}
+
+.glow-lime-sm {
+  box-shadow: 0 0 8px rgba(183, 255, 60, 0.12);
+}
+
+/* Technical custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0B0D0A;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #242820;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3A4034;
+}
+
+/* Code diff styling */
+.diff-add {
+  background-color: rgba(183, 255, 60, 0.08);
+  color: #B7FF3C;
+}
+
+.diff-del {
+  background-color: rgba(255, 92, 104, 0.1);
+  color: #FF5C68;
+}
+
+.diff-header {
+  color: #969B90;
+  background-color: rgba(36, 40, 32, 0.5);
 }
