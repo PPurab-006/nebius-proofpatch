@@ -1,6 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { supabase, isSupabaseConfigured } from './supabaseClient';
+import {
+  getRandomIdleGreeting,
+  determineProcessingStage,
+  useMutteringPhrase,
+  IdleWelcomeCard,
+  ActiveProcessingCard,
+  ActiveProcessingBanner,
+} from './panelPersonality';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 if (API_BASE_URL) {
@@ -37,7 +45,10 @@ import {
   Shield,
   Copy,
   Check,
+  CheckSquare,
+  Square,
   ChevronRight,
+  ChevronDown,
   Menu,
   X,
   Folder,
@@ -105,6 +116,50 @@ export interface RepoFinding {
   explanation: string;
   action?: string;
   proposed_fix: string;
+}
+
+export interface FindingPrStatus {
+  finding_id: string;
+  fingerprint: string;
+  lifecycle_status: 'ready' | 'repairing' | 'verified' | 'pr_open' | 'merged' | 'closed' | 'possible_pr' | 'status_unknown';
+  badge_status: 'READY' | 'PR OPEN' | 'MERGED' | 'PR CLOSED' | 'POSSIBLE EXISTING PR' | 'STATUS UNKNOWN';
+  pr_number: number | null;
+  pr_url: string | null;
+  confidence: 'exact_fingerprint' | 'session_link' | 'branch_match' | 'uncertain' | 'none';
+  is_merged: boolean;
+  is_open: boolean;
+  is_eligible_for_repair: boolean;
+  ineligibility_reason: string | null;
+  reason?: string | null;
+}
+
+export interface BatchRepairFindingResult {
+  finding_id: string;
+  title: string;
+  status: 'verified' | 'repaired' | 'failed' | 'skipped' | 'rolled_back';
+  verification_status: string;
+  error?: string;
+  patch?: string;
+  commit_sha?: string;
+  test_details?: {
+    success: boolean;
+    stdout: string;
+    stderr: string;
+    returncode: number;
+  };
+}
+
+export interface BatchRepairResponse {
+  status: 'success' | 'partial_success' | 'failed';
+  all_succeeded: boolean;
+  summary: {
+    total: number;
+    successful: number;
+    failed: number;
+    skipped: number;
+  };
+  results: BatchRepairFindingResult[];
+  cumulative_patch?: string;
 }
 
 export interface ProjectProfile {
@@ -196,6 +251,8 @@ interface PublishReadiness {
   target_branch?: string;
   published_pr?: any;
   reason?: string;
+  has_open_pr?: boolean;
+  existing_pr?: any;
 }
 
 interface SessionRecord {
@@ -276,11 +333,31 @@ export default function App() {
   const [retryCount, setRetryCount] = useState<number>(0);
   const [diagnosis, setDiagnosis] = useState<DiagnosisResponse | null>(null);
   const [repair, setRepair] = useState<RepairResponse | null>(null);
+
+  // PR Status Awareness & Batch Repair States
+  const [findingPrStatuses, setFindingPrStatuses] = useState<Record<string, FindingPrStatus>>({});
+  const [prStatusLoading, setPrStatusLoading] = useState(false);
+  const [batchMode, setBatchMode] = useState<'selected' | 'all' | 'individual'>('selected');
+  const [selectedFindingIds, setSelectedFindingIds] = useState<string[]>([]);
+  const [batchRepairing, setBatchRepairing] = useState(false);
+  const [batchResult, setBatchResult] = useState<BatchRepairResponse | null>(null);
+  const [confirmAllModalOpen, setConfirmAllModalOpen] = useState(false);
+  const [expandedBatchFindingId, setExpandedBatchFindingId] = useState<string | null>(null);
   const [pipelineStep, setPipelineStep] = useState<number>(0);
   // 0 = idle, 1 = repo prep, 2 = diagnosing, 3 = generating patch, 4 = applying, 5 = verifying, 6 = complete
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
   const [error, setError] = useState('');
+
+  // Code-Ingestion Panel Personality States
+  const [idleGreeting, setIdleGreeting] = useState(() => getRandomIdleGreeting());
+  const isProcessing = loading || batchRepairing;
+  const { stage: currentProcessingStage, technicalStatus: currentTechnicalStatus } =
+    determineProcessingStage(pipelineStep, loadingMessage, batchRepairing);
+  const { phrase: mutteringPhrase, fading: mutteringFading } = useMutteringPhrase(
+    isProcessing,
+    currentProcessingStage
+  );
 
   // Supabase User Authentication States
   const [user, setUser] = useState<{ id: string; email?: string; avatar_url?: string } | null>(null);
@@ -607,6 +684,96 @@ export default function App() {
     }
   };
 
+  const fetchFindingsPrStatus = async (wsId?: string) => {
+    const targetWsId = wsId || workspaceId;
+    if (!targetWsId) return;
+    setPrStatusLoading(true);
+    try {
+      const res = await axios.get(`/api/github/findings/status?workspace_id=${targetWsId}`);
+      if (res.data && res.data.findings) {
+        setFindingPrStatuses(res.data.findings);
+      }
+    } catch (err) {
+      console.error('Failed to check findings PR status:', err);
+    } finally {
+      setPrStatusLoading(false);
+    }
+  };
+
+  const toggleSelectFinding = (findingId: string) => {
+    setSelectedFindingIds((prev) =>
+      prev.includes(findingId) ? prev.filter((id) => id !== findingId) : [...prev, findingId]
+    );
+  };
+
+  const selectAllEligible = () => {
+    if (!diagnosis?.findings) return;
+    const eligible = diagnosis.findings
+      .filter((f) => {
+        const pr = findingPrStatuses[f.id];
+        return !pr || pr.is_eligible_for_repair;
+      })
+      .map((f) => f.id);
+    setSelectedFindingIds(eligible);
+  };
+
+  const deselectAll = () => {
+    setSelectedFindingIds([]);
+  };
+
+  const handleBatchRepair = async (findingIdsToRepair: string[]) => {
+    if (!workspaceId || findingIdsToRepair.length === 0) return;
+    setBatchRepairing(true);
+    setLoading(true);
+    setLoadingMessage(`Executing safe serialized batch repair across ${findingIdsToRepair.length} findings...`);
+    setPipelineStep(5);
+    setError('');
+    try {
+      const res = await axios.post<BatchRepairResponse>('/api/repair/batch', {
+        workspace_id: workspaceId,
+        finding_ids: findingIdsToRepair,
+        test_command: testCommand ? testCommand.trim() : undefined
+      });
+      setBatchResult(res.data);
+      if (res.data.cumulative_patch) {
+        setRepair({
+          status: 'success',
+          workspace_id: workspaceId,
+          patch: res.data.cumulative_patch,
+          patch_applied: res.data.summary.successful > 0,
+          verification_status: res.data.all_succeeded
+            ? 'FIX VERIFIED'
+            : res.data.summary.successful > 0
+            ? 'PARTIAL FIX'
+            : 'FIX FAILED'
+        });
+        setRightPanelView('patch');
+      }
+      setPipelineStep(6);
+      fetchFindingsPrStatus(workspaceId);
+      if (ghWorkspaceInfo || inputType === 'github') {
+        checkPublishReadiness(workspaceId);
+      }
+      if (diagnosis) {
+        saveSession(workspaceId, diagnosis.diagnosis, {
+          status: 'success',
+          workspace_id: workspaceId,
+          patch: res.data.cumulative_patch || '',
+          patch_applied: res.data.summary.successful > 0,
+          verification_status: res.data.all_succeeded ? 'FIX VERIFIED' : 'PARTIAL FIX'
+        });
+      }
+    } catch (err: any) {
+      setError(err.response?.data?.detail || err.message);
+      setPipelineStep(3);
+    } finally {
+      setBatchRepairing(false);
+      setLoading(false);
+      setLoadingMessage('');
+      setConfirmAllModalOpen(false);
+    }
+  };
+
   const handlePublishPR = async () => {
     if (!workspaceId) return;
     setPublishing(true);
@@ -614,7 +781,7 @@ export default function App() {
     try {
       const payload = {
         workspace_id: workspaceId,
-        title: publishTitle.trim() || issueDescription.slice(0, 70) || 'Fix bug autonomously with Patchworks',
+        title: publishTitle.trim() || (issueDescription ? `fix: ${issueDescription.slice(0, 60)}` : 'fix: resolve issue in repository'),
         custom_notes: publishNotes.trim() || undefined
       };
       const res = await axios.post('/api/github/publish', payload);
@@ -635,6 +802,7 @@ export default function App() {
         )
       );
       checkPublishReadiness(workspaceId);
+      fetchFindingsPrStatus(workspaceId);
     } catch (err: any) {
       setPublishError(err.response?.data?.detail || err.message);
     } finally {
@@ -833,6 +1001,7 @@ export default function App() {
       setDiagnosis(response.data);
       if (response.data.workspace_id) {
         setWorkspaceId(response.data.workspace_id);
+        fetchFindingsPrStatus(response.data.workspace_id);
       }
       if (!testCommand && response.data.profile?.detected_test_command) {
         setTestCommand(response.data.profile.detected_test_command);
@@ -851,6 +1020,19 @@ export default function App() {
       setLoadingMessage('');
     }
   };
+
+  // Synchronize eligible findings with selection in batch mode
+  useEffect(() => {
+    if (diagnosis?.findings) {
+      const eligible = diagnosis.findings
+        .filter((f) => {
+          const pr = findingPrStatuses[f.id];
+          return !pr || pr.is_eligible_for_repair;
+        })
+        .map((f) => f.id);
+      setSelectedFindingIds(eligible);
+    }
+  }, [diagnosis?.findings, findingPrStatuses]);
 
   const handleRepair = async () => {
     if (!diagnosis) return;
@@ -885,6 +1067,7 @@ export default function App() {
       saveSession(targetWs, diagnosis.diagnosis, response.data);
       if (ghWorkspaceInfo || inputType === 'github') {
         checkPublishReadiness(targetWs);
+        fetchFindingsPrStatus(targetWs);
       }
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message);
@@ -928,6 +1111,7 @@ export default function App() {
       }
       if (ghWorkspaceInfo || inputType === 'github') {
         checkPublishReadiness(targetWs);
+        fetchFindingsPrStatus(targetWs);
       }
     } catch (err: any) {
       setError(err.response?.data?.detail || err.message);
@@ -1062,6 +1246,7 @@ export default function App() {
     setRepair(null);
     setPipelineStep(0);
     setError('');
+    setIdleGreeting(getRandomIdleGreeting());
   };
 
   const copyWorkspaceId = () => {
@@ -1084,18 +1269,14 @@ export default function App() {
 
   const downloadReport = () => {
     if (!diagnosis || !repair) return;
-    const report = `# Patchworks Repair & Verification Certificate
+    const report = `# Verification Certificate
 
-> Official Autonomous Code-Repair Audit Report
-> Target Engine: Nebius AI Cloud / Token Factory (${health?.model || 'nvidia/Nemotron-3_5-Lightning'})
-
----
-
-## 1. Session Identification
+## 1. Session Summary
 - **Workspace ID:** \`${workspaceId}\`
 - **Target Repository:** \`${repoUrl || (zipFile ? zipFile.name : 'Uploaded Workspace')}\`
-- **Verification Status:** **\`${repair.verification_status || repair.status}\`**
-- **Patch Applied:** \`${repair.patch_applied ? 'YES' : 'NO'}\`
+- **Verification Status:** \`${repair.verification_status || repair.status}\`
+- **Patch Applied:** \`${repair.patch_applied ? 'Yes' : 'No'}\`
+- **Inference Engine:** Nebius Token Factory (${health?.model || 'nvidia/Nemotron-3_5-Lightning'})
 
 ---
 
@@ -1106,7 +1287,7 @@ ${issueDescription}
 
 ---
 
-## 3. Autonomous Diagnosis
+## 3. Diagnosis
 - **Root Cause:** ${diagnosis.diagnosis.diagnosis}
 - **Evidence:**
 \`\`\`
@@ -1117,36 +1298,33 @@ ${diagnosis.diagnosis.evidence}
 
 ---
 
-## 4. Applied Patch (Unified Diff)
+## 4. Applied Patch
 \`\`\`diff
 ${repair.patch}
 \`\`\`
 
 ---
 
-## 5. Sandbox Verification Output
+## 5. Verification Output
 ${
   repair.verification_details
     ? `
 - **Exit Code:** \`${repair.verification_details.returncode}\`
 - **Success:** \`${repair.verification_details.success}\`
 
-### Stdout:
+### Test Output:
 \`\`\`
 ${repair.verification_details.stdout}
 \`\`\`
 
 ${
   repair.verification_details.stderr
-    ? `### Stderr:\n\`\`\`\n${repair.verification_details.stderr}\n\`\`\``
+    ? `### Error Output:\n\`\`\`\n${repair.verification_details.stderr}\n\`\`\``
     : ''
 }
 `
     : '_No test command executed._'
 }
-
----
-*Generated autonomously by Patchworks.*
 `;
     const blob = new Blob([report], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
@@ -2031,6 +2209,15 @@ ${
 
             {/* Right Column: Unified Diff Viewer, Structured Findings & Sandbox Verification */}
             <div className="lg:col-span-7 space-y-6">
+              {/* Active Processing Banner when processing on existing findings/repair */}
+              {(loading || batchRepairing) && (diagnosis || repair) && (
+                <ActiveProcessingBanner
+                  phrase={mutteringPhrase}
+                  fading={mutteringFading}
+                  technicalStatus={currentTechnicalStatus}
+                />
+              )}
+
               {/* Tab Selector if both findings and repair exist */}
               {repair && diagnosis?.findings && diagnosis.findings.length > 0 && (
                 <div className="flex items-center gap-2 bg-[#0B0D0A] p-1.5 rounded-lg border border-[#242820]">
@@ -2203,7 +2390,37 @@ ${
                     ) : ghWorkspaceInfo ? (
                       /* If not published yet, show readiness check */
                       <div className="space-y-2">
-                        {repair.verification_status === 'FIX VERIFIED' ? (
+                        {publishReadiness?.has_open_pr && publishReadiness?.existing_pr ? (
+                          <div className="p-3 bg-[#11140F] border border-[#B7FF3C]/40 rounded space-y-2">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <GitPullRequest className="w-4 h-4 text-[#B7FF3C]" />
+                                <span className="text-xs font-mono font-bold text-[#F4F5F0]">
+                                  {publishReadiness.existing_pr.merged ? 'Repair Already Merged Upstream' : `Pull Request #${publishReadiness.existing_pr.number} Active`}
+                                </span>
+                                <span className={`text-[10px] font-mono uppercase px-1.5 py-0.5 rounded font-bold border ${
+                                  publishReadiness.existing_pr.merged
+                                    ? 'bg-[#A78BFA]/20 text-[#C4B5FD] border-[#A78BFA]/40'
+                                    : 'bg-[#B7FF3C]/15 text-[#B7FF3C] border-[#B7FF3C]/40'
+                                }`}>
+                                  {publishReadiness.existing_pr.merged ? 'MERGED' : 'PR OPEN'}
+                                </span>
+                              </div>
+                              <a
+                                href={publishReadiness.existing_pr.html_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm"
+                              >
+                                <span>Inspect PR #{publishReadiness.existing_pr.number}</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            </div>
+                            <p className="text-[11px] text-[#969B90] font-mono leading-relaxed">
+                              A pull request matching this repair is already tracked: <strong className="text-[#F4F5F0]">{publishReadiness.existing_pr.title}</strong>. Duplicate pull request publication is disabled to prevent branch churn.
+                            </p>
+                          </div>
+                        ) : repair.verification_status === 'FIX VERIFIED' ? (
                           publishReadiness?.diverged ? (
                             <div className="p-3 bg-[#F4BF50]/10 border border-[#F4BF50]/30 rounded text-xs font-mono text-[#F4BF50] space-y-1">
                               <div className="flex items-center gap-1.5 font-bold">
@@ -2350,12 +2567,286 @@ ${
                     <p>{diagnosis.investigation?.summary || diagnosis.diagnosis.diagnosis}</p>
                   </div>
 
+                  {/* Batch Action Toolbar */}
+                  <div className="bg-[#11140F] border border-[#242820] rounded-lg p-3 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#242820] pb-2.5">
+                      {/* Mode Selector Tabs */}
+                      <div className="flex items-center gap-1 bg-[#050505] p-1 rounded-md border border-[#242820]">
+                        <button
+                          type="button"
+                          onClick={() => setBatchMode('selected')}
+                          className={`px-3 py-1 rounded text-xs font-mono font-bold transition-all flex items-center gap-1.5 ${
+                            batchMode === 'selected'
+                              ? 'bg-[#B7FF3C] text-[#050505] glow-lime-sm'
+                              : 'text-[#969B90] hover:text-[#F4F5F0]'
+                          }`}
+                        >
+                          <CheckSquare className="w-3.5 h-3.5" />
+                          <span>Repair Selected</span>
+                          {selectedFindingIds.length > 0 && (
+                            <span
+                              className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+                                batchMode === 'selected' ? 'bg-[#050505] text-[#B7FF3C]' : 'bg-[#1A1F14] text-[#B7FF3C]'
+                              }`}
+                            >
+                              {selectedFindingIds.length}
+                            </span>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setBatchMode('all')}
+                          className={`px-3 py-1 rounded text-xs font-mono font-bold transition-all flex items-center gap-1.5 ${
+                            batchMode === 'all'
+                              ? 'bg-[#B7FF3C] text-[#050505] glow-lime-sm'
+                              : 'text-[#969B90] hover:text-[#F4F5F0]'
+                          }`}
+                        >
+                          <Layers className="w-3.5 h-3.5" />
+                          <span>Repair All</span>
+                          <span
+                            className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
+                              batchMode === 'all' ? 'bg-[#050505] text-[#B7FF3C]' : 'bg-[#1A1F14] text-[#969B90]'
+                            }`}
+                          >
+                            {diagnosis.findings.filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length}
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setBatchMode('individual')}
+                          className={`px-3 py-1 rounded text-xs font-mono font-bold transition-all flex items-center gap-1.5 ${
+                            batchMode === 'individual'
+                              ? 'bg-[#B7FF3C] text-[#050505] glow-lime-sm'
+                              : 'text-[#969B90] hover:text-[#F4F5F0]'
+                          }`}
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>Repair Individually</span>
+                        </button>
+                      </div>
+
+                      {/* PR Status Refresh Button */}
+                      <button
+                        type="button"
+                        onClick={() => fetchFindingsPrStatus()}
+                        disabled={prStatusLoading || !workspaceId}
+                        title="Check GitHub for recent pull requests matching these findings"
+                        className="px-2.5 py-1 rounded bg-[#050505] hover:bg-[#1A1F14] border border-[#242820] hover:border-[#B7FF3C]/50 text-xs font-mono text-[#969B90] hover:text-[#B7FF3C] transition-all flex items-center gap-1.5 disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${prStatusLoading ? 'animate-spin text-[#B7FF3C]' : ''}`} />
+                        <span>{prStatusLoading ? 'Checking GitHub...' : 'Refresh PR Status'}</span>
+                      </button>
+                    </div>
+
+                    {/* Mode Sub-bar */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                      {batchMode === 'selected' && (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={selectAllEligible}
+                              className="text-[11px] text-[#B7FF3C] hover:underline hover:text-[#D4FF8A]"
+                            >
+                              Select All Eligible
+                            </button>
+                            <span className="text-[#3A4034]">&bull;</span>
+                            <button
+                              type="button"
+                              onClick={deselectAll}
+                              className="text-[11px] text-[#969B90] hover:underline hover:text-[#F4F5F0]"
+                            >
+                              Clear Selection
+                            </button>
+                            <span className="text-[11px] text-[#969B90] ml-1">
+                              ({selectedFindingIds.length} of {diagnosis.findings.length} selected)
+                            </span>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => handleBatchRepair(selectedFindingIds)}
+                            disabled={selectedFindingIds.length === 0 || loading || batchRepairing}
+                            className="px-3.5 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] disabled:opacity-40 text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm flex items-center gap-1.5"
+                          >
+                            {batchRepairing ? (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                <span>Synthesizing Batch...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="w-3.5 h-3.5" />
+                                <span>Repair {selectedFindingIds.length} Selected Finding{selectedFindingIds.length === 1 ? '' : 's'}</span>
+                              </>
+                            )}
+                          </button>
+                        </>
+                      )}
+
+                      {batchMode === 'all' && (
+                        <>
+                          <div className="text-[11px] text-[#969B90]">
+                            Sequentially fixes eligible findings with automatic rollback if test verification fails.
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmAllModalOpen(true)}
+                            disabled={
+                              diagnosis.findings.filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length === 0 ||
+                              loading || batchRepairing
+                            }
+                            className="px-3.5 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] disabled:opacity-40 text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm flex items-center gap-1.5"
+                          >
+                            {batchRepairing ? (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                <span>Processing Batch...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Layers className="w-3.5 h-3.5" />
+                                <span>Review & Repair All ({diagnosis.findings.filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length} Eligible)</span>
+                              </>
+                            )}
+                          </button>
+                        </>
+                      )}
+
+                      {batchMode === 'individual' && (
+                        <div className="text-[11px] text-[#969B90]">
+                          Individual Mode active. Review findings below and click "Synthesize & Apply Scoped Fix" on any finding.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Batch Execution Results Summary Card */}
+                  {batchResult && (
+                    <div className="bg-[#11140F] border border-[#242820] rounded-lg p-3.5 space-y-3">
+                      <div className="flex items-center justify-between border-b border-[#242820] pb-2">
+                        <div className="flex items-center gap-2">
+                          {batchResult.all_succeeded ? (
+                            <CheckCircle2 className="w-4 h-4 text-[#B7FF3C]" />
+                          ) : batchResult.summary.successful > 0 ? (
+                            <AlertTriangle className="w-4 h-4 text-[#F4BF50]" />
+                          ) : (
+                            <XCircle className="w-4 h-4 text-[#FF5C68]" />
+                          )}
+                          <h4 className="text-xs font-mono font-bold uppercase text-[#F4F5F0]">
+                            Batch Execution Summary: {batchResult.all_succeeded ? 'All Verified' : batchResult.summary.successful > 0 ? 'Partial Verification' : 'Execution Failed'}
+                          </h4>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setBatchResult(null)}
+                          className="text-[11px] font-mono text-[#969B90] hover:text-[#F4F5F0]"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+
+                      {/* Summary Metrics */}
+                      <div className="grid grid-cols-4 gap-2 text-center font-mono">
+                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
+                          <div className="text-[10px] text-[#969B90] uppercase">Total</div>
+                          <div className="text-sm font-bold text-[#F4F5F0]">{batchResult.summary.total}</div>
+                        </div>
+                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
+                          <div className="text-[10px] text-[#B7FF3C] uppercase">Verified</div>
+                          <div className="text-sm font-bold text-[#B7FF3C]">{batchResult.summary.successful}</div>
+                        </div>
+                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
+                          <div className="text-[10px] text-[#FF5C68] uppercase">Failed</div>
+                          <div className="text-sm font-bold text-[#FF5C68]">{batchResult.summary.failed}</div>
+                        </div>
+                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
+                          <div className="text-[10px] text-[#969B90] uppercase">Skipped</div>
+                          <div className="text-sm font-bold text-[#969B90]">{batchResult.summary.skipped}</div>
+                        </div>
+                      </div>
+
+                      {/* Per-finding status detail */}
+                      <div className="space-y-1.5 pt-1">
+                        {batchResult.results.map((res) => {
+                          const isExpanded = expandedBatchFindingId === res.finding_id;
+                          const isSuccess = res.status === 'verified';
+                          const isFailed = res.status === 'failed' || res.status === 'rolled_back';
+                          return (
+                            <div
+                              key={res.finding_id}
+                              className="bg-[#050505] border border-[#242820] rounded p-2 text-xs font-mono space-y-1.5"
+                            >
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <span
+                                    className={`text-[10px] uppercase px-1.5 py-0.5 rounded font-bold border ${
+                                      isSuccess
+                                        ? 'bg-[#B7FF3C]/10 text-[#B7FF3C] border-[#B7FF3C]/30'
+                                        : isFailed
+                                        ? 'bg-[#FF5C68]/10 text-[#FF5C68] border-[#FF5C68]/30'
+                                        : 'bg-[#242820] text-[#969B90] border-[#3A4034]'
+                                    }`}
+                                  >
+                                    {res.status.toUpperCase()}
+                                  </span>
+                                  <span className="text-[#F4F5F0] font-bold">#{res.finding_id}</span>
+                                  <span className="text-[#969B90] truncate max-w-[280px]">{res.title}</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-[10px] text-[#969B90]">
+                                    {res.verification_status}
+                                  </span>
+                                  {res.test_details && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setExpandedBatchFindingId(isExpanded ? null : res.finding_id)}
+                                      className="text-[10px] text-[#B7FF3C] hover:underline flex items-center gap-0.5"
+                                    >
+                                      <span>{isExpanded ? 'Hide Log' : 'View Log'}</span>
+                                      <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+
+                              {res.error && (
+                                <div className="text-[11px] text-[#FF5C68] bg-[#FF5C68]/10 p-1.5 rounded border border-[#FF5C68]/20">
+                                  {res.error}
+                                </div>
+                              )}
+
+                              {isExpanded && res.test_details && (
+                                <div className="mt-2 space-y-1">
+                                  <div className="text-[10px] text-[#969B90] uppercase flex justify-between">
+                                    <span>Exit Code: {res.test_details.returncode}</span>
+                                    <span>{res.test_details.success ? 'Tests Passed' : 'Tests Failed (Rolled Back)'}</span>
+                                  </div>
+                                  <pre className="text-[10px] bg-[#0A0D08] p-2 rounded text-[#969B90] overflow-x-auto max-h-40 whitespace-pre-wrap">
+                                    {res.test_details.stdout || res.test_details.stderr || 'No output recorded'}
+                                  </pre>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Findings Cards List */}
                   <div className="space-y-3">
                     {diagnosis.findings.map((finding, idx) => {
                       const isSelected = selectedFinding?.id === finding.id;
                       const isHigh = finding.severity === 'high' || finding.severity === 'critical';
                       const isMed = finding.severity === 'medium';
+                      const prStatus = findingPrStatuses[finding.id];
+                      const isEligible = !prStatus || prStatus.is_eligible_for_repair;
+                      const isChecked = selectedFindingIds.includes(finding.id);
+
                       return (
                         <div
                           key={finding.id || idx}
@@ -2371,28 +2862,101 @@ ${
                         >
                           {/* Finding Header */}
                           <div className="flex items-start justify-between gap-2">
-                            <div>
-                              <div className="flex items-center gap-2 mb-1">
-                                <span className="text-[10px] font-mono text-[#969B90]">#{finding.id}</span>
-                                <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#11140F] text-[#B7FF3C] border border-[#242820]">
-                                  {finding.category || 'IMPROVEMENT'}
-                                </span>
-                                <span
-                                  className={`text-[10px] font-mono uppercase px-1.5 py-0.5 rounded font-bold border ${
-                                    isHigh
-                                      ? 'bg-[#FF5C68]/10 text-[#FF5C68] border-[#FF5C68]/30'
-                                      : isMed
-                                      ? 'bg-[#F4BF50]/10 text-[#F4BF50] border-[#F4BF50]/30'
-                                      : 'bg-[#242820] text-[#969B90] border-[#3A4034]'
-                                  }`}
+                            <div className="flex items-start gap-2.5">
+                              {/* Selection Checkbox for Batch Mode */}
+                              {batchMode === 'selected' && (
+                                <button
+                                  type="button"
+                                  disabled={!isEligible}
+                                  onClick={() => toggleSelectFinding(finding.id)}
+                                  className="text-[#B7FF3C] disabled:opacity-30 disabled:cursor-not-allowed hover:text-[#D4FF8A] transition-colors pt-0.5 shrink-0"
+                                  title={!isEligible ? (prStatus?.ineligibility_reason || 'Ineligible for batch repair') : (isChecked ? 'Deselect finding' : 'Select finding')}
                                 >
-                                  {finding.severity} Severity
-                                </span>
-                                <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#050505] text-[#969B90] border border-[#242820]">
-                                  {finding.confidence} Confidence
-                                </span>
+                                  {isChecked ? (
+                                    <CheckSquare className="w-4 h-4 text-[#B7FF3C]" />
+                                  ) : (
+                                    <Square className="w-4 h-4 text-[#969B90]" />
+                                  )}
+                                </button>
+                              )}
+
+                              <div>
+                                <div className="flex flex-wrap items-center gap-1.5 mb-1">
+                                  <span className="text-[10px] font-mono text-[#969B90]">#{finding.id}</span>
+                                  <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#11140F] text-[#B7FF3C] border border-[#242820]">
+                                    {finding.category || 'IMPROVEMENT'}
+                                  </span>
+                                  <span
+                                    className={`text-[10px] font-mono uppercase px-1.5 py-0.5 rounded font-bold border ${
+                                      isHigh
+                                        ? 'bg-[#FF5C68]/10 text-[#FF5C68] border-[#FF5C68]/30'
+                                        : isMed
+                                        ? 'bg-[#F4BF50]/10 text-[#F4BF50] border-[#F4BF50]/30'
+                                        : 'bg-[#242820] text-[#969B90] border-[#3A4034]'
+                                    }`}
+                                  >
+                                    {finding.severity} Severity
+                                  </span>
+                                  <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#050505] text-[#969B90] border border-[#242820]">
+                                    {finding.confidence} Confidence
+                                  </span>
+
+                                  {/* PR Lifecycle Status Badges */}
+                                  {prStatus && prStatus.badge_status === 'MERGED' && prStatus.pr_url && (
+                                    <a
+                                      href={prStatus.pr_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-[10px] font-mono uppercase px-2 py-0.5 rounded font-bold bg-[#A78BFA]/15 text-[#C4B5FD] border border-[#A78BFA]/40 hover:bg-[#A78BFA]/25 transition-all inline-flex items-center gap-1"
+                                    >
+                                      <span>MERGED #{prStatus.pr_number}</span>
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                  {prStatus && prStatus.badge_status === 'PR OPEN' && prStatus.pr_url && (
+                                    <a
+                                      href={prStatus.pr_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-[10px] font-mono uppercase px-2 py-0.5 rounded font-bold bg-[#B7FF3C]/15 text-[#B7FF3C] border border-[#B7FF3C]/40 hover:bg-[#B7FF3C]/25 transition-all inline-flex items-center gap-1"
+                                    >
+                                      <span>PR OPEN #{prStatus.pr_number}</span>
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                  {prStatus && prStatus.badge_status === 'POSSIBLE EXISTING PR' && prStatus.pr_url && (
+                                    <a
+                                      href={prStatus.pr_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-[10px] font-mono uppercase px-2 py-0.5 rounded font-bold bg-[#F4BF50]/15 text-[#F4BF50] border border-[#F4BF50]/40 hover:bg-[#F4BF50]/25 transition-all inline-flex items-center gap-1"
+                                    >
+                                      <span>POSSIBLE EXISTING PR #{prStatus.pr_number}</span>
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                  {prStatus && prStatus.badge_status === 'STATUS UNKNOWN' && (
+                                    <span
+                                      title={prStatus.reason || 'GitHub PR status could not be verified'}
+                                      className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#242820] text-[#969B90] border border-[#3A4034]"
+                                    >
+                                      STATUS UNKNOWN
+                                    </span>
+                                  )}
+                                  {prStatus && prStatus.badge_status === 'PR CLOSED' && prStatus.pr_url && (
+                                    <a
+                                      href={prStatus.pr_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#FF5C68]/15 text-[#FF5C68] border border-[#FF5C68]/30 hover:bg-[#FF5C68]/25 transition-all inline-flex items-center gap-1"
+                                    >
+                                      <span>PR CLOSED #{prStatus.pr_number}</span>
+                                      <ExternalLink className="w-2.5 h-2.5" />
+                                    </a>
+                                  )}
+                                </div>
+                                <h4 className="text-xs font-mono font-bold text-[#F4F5F0] leading-snug">{finding.title}</h4>
                               </div>
-                              <h4 className="text-xs font-mono font-bold text-[#F4F5F0] leading-snug">{finding.title}</h4>
                             </div>
                           </div>
 
@@ -2429,55 +2993,52 @@ ${
                               {finding.proposed_fix}
                             </div>
 
-                            <button
-                              onClick={() => handleRepairFinding(finding)}
-                              disabled={loading}
-                              className="w-full py-2 px-3 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] disabled:opacity-40 text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm flex items-center justify-center gap-1.5"
-                            >
-                              <Sparkles className="w-3.5 h-3.5" />
-                              <span>Synthesize & Apply Scoped Fix for #{finding.id}</span>
-                            </button>
+                            {!isEligible ? (
+                              <div className="p-2.5 bg-[#11140F] border border-[#242820] rounded text-xs font-mono text-[#969B90] flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  <GitPullRequest className="w-3.5 h-3.5 text-[#B7FF3C]" />
+                                  <span className="text-[11px] text-[#F4F5F0]">
+                                    {prStatus?.ineligibility_reason || 'Finding already submitted or merged'}
+                                  </span>
+                                </div>
+                                {prStatus?.pr_url && (
+                                  <a
+                                    href={prStatus.pr_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 text-[11px] text-[#B7FF3C] hover:underline shrink-0 ml-2 font-bold"
+                                  >
+                                    <span>Inspect PR #{prStatus.pr_number}</span>
+                                    <ExternalLink className="w-3 h-3" />
+                                  </a>
+                                )}
+                              </div>
+                            ) : (
+                              <button
+                                onClick={() => handleRepairFinding(finding)}
+                                disabled={loading || batchRepairing}
+                                className="w-full py-2 px-3 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] disabled:opacity-40 text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm flex items-center justify-center gap-1.5"
+                              >
+                                <Sparkles className="w-3.5 h-3.5" />
+                                <span>Synthesize & Apply Scoped Fix for #{finding.id}</span>
+                              </button>
+                            )}
                           </div>
                         </div>
                       );
                     })}
                   </div>
                 </div>
+              ) : isProcessing ? (
+                /* Active Processing State */
+                <ActiveProcessingCard
+                  phrase={mutteringPhrase}
+                  fading={mutteringFading}
+                  technicalStatus={currentTechnicalStatus}
+                />
               ) : (
-                /* Empty State */
-                <div className="h-full border border-[#242820] bg-[#0B0D0A] rounded-lg p-8 flex flex-col items-center justify-center text-center space-y-4 engineering-grid min-h-[420px]">
-                  <div className="relative group">
-                    <div className="absolute -inset-1.5 rounded-2xl bg-gradient-to-b from-[#B7FF3C]/20 to-transparent blur-md group-hover:from-[#B7FF3C]/35 transition duration-500 opacity-80" />
-                    <img
-                      src="/patchworks-squircle.png"
-                      alt="Patchworks Workbench"
-                      className="relative w-16 h-16 rounded-xl object-contain drop-shadow-[0_0_20px_rgba(183,255,60,0.25)]"
-                    />
-                  </div>
-                  <div className="max-w-md space-y-1.5">
-                    <h3 className="text-sm font-mono uppercase tracking-wider text-[#F4F5F0] font-bold">
-                      Awaiting Code Ingestion
-                    </h3>
-                    <p className="text-xs text-[#969B90] leading-relaxed">
-                      Supply a Git repository URL, upload a ZIP archive, or select a benchmark target to initiate
-                      empirical diagnosis and patch generation.
-                    </p>
-                  </div>
-                  <div className="flex gap-2 pt-2">
-                    <button
-                      onClick={() => loadBenchmark('simple_bug')}
-                      className="text-xs font-mono bg-[#11140F] hover:bg-[#191D16] border border-[#242820] hover:border-[#B7FF3C] text-[#B7FF3C] px-3 py-1.5 rounded transition-colors"
-                    >
-                      Load simple_bug
-                    </button>
-                    <button
-                      onClick={() => loadBenchmark('edge_case')}
-                      className="text-xs font-mono bg-[#11140F] hover:bg-[#191D16] border border-[#242820] hover:border-[#B7FF3C] text-[#B7FF3C] px-3 py-1.5 rounded transition-colors"
-                    >
-                      Load edge_case
-                    </button>
-                  </div>
-                </div>
+                /* Idle Welcome State */
+                <IdleWelcomeCard greeting={idleGreeting} />
               )}
             </div>
           </div>
@@ -2944,6 +3505,109 @@ NEBIUS_MODEL_NAME="nvidia/Nemotron-3_5-Lightning"`}
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation Modal for Repair All */}
+      {confirmAllModalOpen && diagnosis && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+          <div className="bg-[#0B0D0A] border border-[#242820] p-6 rounded-lg max-w-lg w-full space-y-4 glow-lime-sm">
+            <div className="flex items-center justify-between border-b border-[#242820] pb-3">
+              <div className="flex items-center gap-2 text-[#F4F5F0]">
+                <Layers className="w-5 h-5 text-[#B7FF3C]" />
+                <h4 className="text-sm font-mono uppercase font-bold">Confirm Batch Repair Execution</h4>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmAllModalOpen(false)}
+                className="text-[#969B90] hover:text-[#F4F5F0]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs font-mono">
+              <p className="text-[#969B90] leading-relaxed">
+                Patchworks will synthesize targeted patches and run sandbox test verifications sequentially across all eligible findings.
+              </p>
+
+              {/* Eligible Findings */}
+              <div className="p-3 bg-[#11140F] border border-[#B7FF3C]/30 rounded space-y-2">
+                <div className="flex items-center justify-between text-[#B7FF3C] font-bold">
+                  <span>Eligible Findings to Repair:</span>
+                  <span>
+                    {(diagnosis.findings || []).filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length}
+                  </span>
+                </div>
+                <div className="max-h-32 overflow-y-auto space-y-1.5 pr-1 text-[11px] text-[#F4F5F0]">
+                  {(diagnosis.findings || [])
+                    .filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair)
+                    .map((f) => (
+                      <div key={f.id} className="flex items-center gap-1.5 truncate">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-[#B7FF3C] shrink-0" />
+                        <span className="text-[#969B90]">#{f.id}</span>
+                        <span className="truncate">{f.title}</span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+
+              {/* Ineligible / Skipped Findings */}
+              {(diagnosis.findings || []).some((f) => findingPrStatuses[f.id] && !findingPrStatuses[f.id].is_eligible_for_repair) && (
+                <div className="p-3 bg-[#050505] border border-[#242820] rounded space-y-2">
+                  <div className="flex items-center justify-between text-[#969B90] font-bold">
+                    <span>Skipped Findings (Already PR'd / Merged):</span>
+                    <span>
+                      {(diagnosis.findings || []).filter((f) => findingPrStatuses[f.id] && !findingPrStatuses[f.id].is_eligible_for_repair).length}
+                    </span>
+                  </div>
+                  <div className="max-h-24 overflow-y-auto space-y-1.5 pr-1 text-[11px] text-[#969B90]">
+                    {(diagnosis.findings || [])
+                      .filter((f) => findingPrStatuses[f.id] && !findingPrStatuses[f.id].is_eligible_for_repair)
+                      .map((f) => {
+                        const pr = findingPrStatuses[f.id];
+                        return (
+                          <div key={f.id} className="flex items-center justify-between text-[11px]">
+                            <span className="truncate max-w-[280px]">#{f.id} {f.title}</span>
+                            <span className="text-[#F4BF50] shrink-0 font-bold">{pr?.badge_status || 'INELIGIBLE'}</span>
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
+              )}
+
+              {/* Safeguards Summary */}
+              <div className="p-2.5 bg-[#050505] rounded border border-[#242820] text-[10px] text-[#969B90] leading-relaxed space-y-1">
+                <span className="text-[#B7FF3C] font-semibold block">Execution & Rollback Guarantee:</span>
+                Repairs are serialized with automatic git checkpointing. If any repair causes test failure or patch conflict, its changes are immediately rolled back to the pre-finding checkpoint without corrupting other repairs. Batch repair does not automatically publish PRs.
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setConfirmAllModalOpen(false)}
+                className="px-3 py-1.5 rounded bg-[#11140F] border border-[#242820] text-xs font-mono text-[#969B90] hover:text-[#F4F5F0]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmAllModalOpen(false);
+                  const eligibleIds = (diagnosis.findings || [])
+                    .filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair)
+                    .map((f) => f.id);
+                  handleBatchRepair(eligibleIds);
+                }}
+                className="px-4 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] text-[#050505] text-xs font-mono font-bold transition-all glow-lime flex items-center gap-1.5"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>Confirm & Start Batch Repair</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

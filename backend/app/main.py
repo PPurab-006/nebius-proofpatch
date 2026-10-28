@@ -9,6 +9,7 @@ import tempfile
 import logging
 from typing import Optional, List, Dict, Any
 import re
+from git import Repo
 from .workspace import WorkspaceManager, get_benchmark_fixtures_dir, resolve_benchmark_fixture_name
 from .patch_engine import PatchEngine
 from .nebius_client import NebiusClient, NebiusInferenceError
@@ -17,6 +18,7 @@ from .intent_classifier import classify_intent, RequestIntent
 from .repo_inspector import RepoInspector, IGNORE_DIRS, IGNORE_EXTS
 from .auth import AuthUser, get_optional_user, get_current_user, supabase_manager
 from .crypto import token_encryptor, TokenEncryptionError
+from .reporting import compute_finding_fingerprint, format_commit_title
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,11 @@ class RepairRequest(BaseModel):
     issue_description: str
     diagnosis_context: Optional[dict] = None
     selected_finding: Optional[dict] = None
+    test_command: Optional[str] = None
+
+class BatchRepairRequest(BaseModel):
+    workspace_id: str
+    finding_ids: List[str]
     test_command: Optional[str] = None
 
 class InspectRequest(BaseModel):
@@ -556,18 +563,19 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
             else:
                 verification_result = "FIX FAILED"
 
-        workspace_manager.update_workspace_metadata(
-            ws_id,
-            {
-                "issue_description": request.issue_description,
-                "diagnosis_context": request.diagnosis_context,
-                "patch": patch,
-                "patch_applied": True,
-                "verification_status": verification_result,
-                "verification_details": test_details,
-                "user_id": user.id if user else None
-            }
-        )
+        metadata_update = {
+            "issue_description": request.issue_description,
+            "diagnosis_context": request.diagnosis_context,
+            "patch": patch,
+            "patch_applied": True,
+            "verification_status": verification_result,
+            "verification_details": test_details,
+            "user_id": user.id if user else None
+        }
+        if request.selected_finding:
+            metadata_update["selected_finding"] = request.selected_finding
+            metadata_update["repaired_finding_id"] = str(request.selected_finding.get("id", ""))
+        workspace_manager.update_workspace_metadata(ws_id, metadata_update)
 
         if user and supabase_manager.is_configured:
             meta = workspace_manager.get_workspace_metadata(ws_id) or {}
@@ -919,11 +927,41 @@ def github_publish_readiness(workspace_id: str, user: Optional[AuthUser] = Depen
             
     ready = (verification_status == "FIX VERIFIED") and not diverged
     reason = None
+    existing_pr = None
+
     if verification_status != "FIX VERIFIED":
         reason = f"Verification is {verification_status}. Only 'FIX VERIFIED' patches can be published."
     elif diverged:
         reason = f"Target branch '{meta['target_branch']}' has diverged on remote."
-        
+
+    # Prevent duplicate PRs: check if an open or merged PR already exists for this repair
+    if token and meta.get("owner") and meta.get("repo"):
+        try:
+            prs = github_service.list_repository_pull_requests(token, meta["owner"], meta["repo"], state="all")
+            findings_to_check = []
+            if meta.get("selected_finding"):
+                findings_to_check = [meta["selected_finding"]]
+            elif meta.get("batch_repaired_findings"):
+                findings_to_check = meta["batch_repaired_findings"]
+            elif meta.get("findings"):
+                findings_to_check = meta["findings"]
+
+            matched = github_service.match_findings_to_pull_requests(findings_to_check, prs, workspace_meta=meta)
+            for m in matched.values():
+                if m.get("confidence") in ("exact_fingerprint", "session_link"):
+                    if m.get("is_merged"):
+                        existing_pr = m
+                        ready = False
+                        reason = f"A pull request (#{m.get('pr_number')}) for this repair has already been merged: {m.get('pr_url')}"
+                        break
+                    elif m.get("is_open"):
+                        existing_pr = m
+                        ready = False
+                        reason = f"A pull request (#{m.get('pr_number')}) has already been submitted for this repair: {m.get('pr_url')}"
+                        break
+        except Exception as e:
+            logger.warning(f"Could not verify existing PRs in readiness: {e}")
+
     return {
         "ready": ready,
         "verification_status": verification_status,
@@ -934,6 +972,7 @@ def github_publish_readiness(workspace_id: str, user: Optional[AuthUser] = Depen
         "repo": meta.get("repo"),
         "target_branch": meta.get("target_branch"),
         "published_pr": meta.get("published_pr"),
+        "existing_pr": existing_pr,
         "reason": reason
     }
 
@@ -974,10 +1013,55 @@ def github_publish(request: GitHubPublishRequest, user: Optional[AuthUser] = Dep
             status_code=409,
             detail=f"Target branch '{meta['target_branch']}' has diverged on remote. Current SHA: {remote_sha[:8] if remote_sha else 'unknown'}. Publication aborted to prevent conflicts."
         )
+
+    # Check for existing PR: prevent duplicate publication if confidently matched
+    if meta.get("owner") and meta.get("repo"):
+        try:
+            prs = github_service.list_repository_pull_requests(token, meta["owner"], meta["repo"], state="all")
+            findings_to_check = []
+            if meta.get("selected_finding"):
+                findings_to_check = [meta["selected_finding"]]
+            elif meta.get("batch_repaired_findings"):
+                findings_to_check = meta["batch_repaired_findings"]
+            elif meta.get("findings"):
+                findings_to_check = meta["findings"]
+
+            matched = github_service.match_findings_to_pull_requests(findings_to_check, prs, workspace_meta=meta)
+            for m in matched.values():
+                if m.get("confidence") in ("exact_fingerprint", "session_link"):
+                    if m.get("is_merged") or m.get("is_open"):
+                        st_desc = "merged" if m.get("is_merged") else "already open"
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"Duplicate PR prevented: Pull request #{m.get('pr_number')} is {st_desc} for this repair ({m.get('pr_url')})."
+                        )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"Could not verify existing PRs before publishing: {e}")
         
-    title = request.title or meta.get("issue_description") or "Autonomous patch repair"
+    title = request.title or meta.get("issue_description") or "Resolve defect in target repository"
     if len(title) > 80:
         title = title[:77] + "..."
+
+    # Gather fingerprints and finding IDs for machine-readable traceability
+    finding_fingerprints: List[str] = []
+    finding_ids: List[str] = []
+    if meta.get("selected_finding"):
+        sf = meta["selected_finding"]
+        finding_fingerprints.append(compute_finding_fingerprint(sf))
+        if "id" in sf:
+            finding_ids.append(str(sf["id"]))
+    elif meta.get("batch_repaired_findings"):
+        for bf in meta["batch_repaired_findings"]:
+            finding_fingerprints.append(compute_finding_fingerprint(bf))
+            if "id" in bf:
+                finding_ids.append(str(bf["id"]))
+    elif meta.get("findings"):
+        for f in meta["findings"]:
+            finding_fingerprints.append(compute_finding_fingerprint(f))
+            if "id" in f:
+                finding_ids.append(str(f["id"]))
         
     try:
         pr_result = github_service.publish_pull_request(
@@ -989,12 +1073,14 @@ def github_publish(request: GitHubPublishRequest, user: Optional[AuthUser] = Dep
             workspace_path=ws_path,
             workspace_id=request.workspace_id,
             title=title,
-            problem_summary=meta.get("issue_description", "Autonomously repaired bug"),
+            problem_summary=meta.get("issue_description", "Resolve defect in codebase"),
             diagnosis_data=meta.get("diagnosis", meta.get("diagnosis_context", {})),
             verification_details=meta.get("verification_details"),
             model_name=nebius_client.model_name,
             is_mock_mode=nebius_client.mock_mode,
-            custom_notes=request.custom_notes
+            custom_notes=request.custom_notes,
+            finding_fingerprints=finding_fingerprints,
+            finding_ids=finding_ids
         )
         meta["published_pr"] = pr_result
         workspace_manager.update_workspace_metadata(request.workspace_id, meta)
@@ -1023,6 +1109,366 @@ def github_publish(request: GitHubPublishRequest, user: Optional[AuthUser] = Dep
         return pr_result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/github/findings/status")
+def github_findings_status(workspace_id: str, user: Optional[AuthUser] = Depends(get_optional_user)):
+    """
+    Live query repository pull requests and match against workspace findings.
+    Returns structured status (PR OPEN, MERGED, PR CLOSED, POSSIBLE EXISTING PR, READY, or STATUS UNKNOWN).
+    Scoped strictly to repository and authenticated user.
+    """
+    verify_workspace_access(workspace_id, user)
+    meta = workspace_manager.get_workspace_metadata(workspace_id) or {}
+    findings = meta.get("findings", [])
+    if not findings and meta.get("selected_finding"):
+        findings = [meta["selected_finding"]]
+
+    owner = meta.get("owner")
+    repo = meta.get("repo")
+    is_github = (meta.get("source_type") == "github") or bool(owner and repo)
+
+    if not is_github or not owner or not repo:
+        return {
+            "status": "not_linked",
+            "github_connected": False,
+            "repository": None,
+            "findings": {
+                str(f.get("id")): {
+                    "finding_id": str(f.get("id")),
+                    "fingerprint": compute_finding_fingerprint(f),
+                    "lifecycle_status": "ready",
+                    "badge_status": "READY",
+                    "pr_number": None,
+                    "pr_url": None,
+                    "confidence": "none",
+                    "is_merged": False,
+                    "is_open": False,
+                    "is_eligible_for_repair": True,
+                    "ineligibility_reason": None
+                }
+                for f in findings if "id" in f
+            }
+        }
+
+    token = resolve_github_token(user)
+    if not token:
+        return {
+            "status": "error",
+            "github_connected": False,
+            "repository": f"{owner}/{repo}",
+            "error": "GitHub credentials not found or disconnected",
+            "findings": {
+                str(f.get("id")): {
+                    "finding_id": str(f.get("id")),
+                    "fingerprint": compute_finding_fingerprint(f),
+                    "lifecycle_status": "status_unknown",
+                    "badge_status": "STATUS UNKNOWN",
+                    "pr_number": None,
+                    "pr_url": None,
+                    "confidence": "none",
+                    "is_merged": False,
+                    "is_open": False,
+                    "is_eligible_for_repair": True,
+                    "ineligibility_reason": "GitHub is not connected"
+                }
+                for f in findings if "id" in f
+            }
+        }
+
+    try:
+        prs = github_service.list_repository_pull_requests(token, owner, repo, state="all")
+    except Exception as e:
+        logger.warning(f"Failed to query GitHub PRs for findings status: {e}")
+        return {
+            "status": "error",
+            "github_connected": True,
+            "repository": f"{owner}/{repo}",
+            "error": str(e),
+            "findings": {
+                str(f.get("id")): {
+                    "finding_id": str(f.get("id")),
+                    "fingerprint": compute_finding_fingerprint(f),
+                    "lifecycle_status": "status_unknown",
+                    "badge_status": "STATUS UNKNOWN",
+                    "pr_number": None,
+                    "pr_url": None,
+                    "confidence": "none",
+                    "is_merged": False,
+                    "is_open": False,
+                    "is_eligible_for_repair": True,
+                    "ineligibility_reason": f"GitHub API error: {str(e)}"
+                }
+                for f in findings if "id" in f
+            }
+        }
+
+    repair_sessions: List[Dict[str, Any]] = []
+    if user and supabase_manager.is_configured:
+        try:
+            repair_sessions = supabase_manager.list_repair_sessions(user.id, limit=30)
+        except Exception as e:
+            logger.warning(f"Could not load repair sessions for user {user.id}: {e}")
+
+    matched = github_service.match_findings_to_pull_requests(
+        findings=findings,
+        pull_requests=prs,
+        workspace_meta=meta,
+        repair_sessions=repair_sessions
+    )
+
+    return {
+        "status": "success",
+        "github_connected": True,
+        "repository": f"{owner}/{repo}",
+        "findings": matched
+    }
+
+@app.post("/api/repair/batch")
+def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
+    """
+    Safely execute batch repair across multiple findings:
+    - Serialized execution to avoid conflicting modifications
+    - Checkpoint and automatic rollback if an individual patch or verification test fails
+    - Per-finding results and cumulative diff
+    - Verification safeguards maintained
+    - Batch repair and PR publishing remain separate actions
+    """
+    verify_workspace_access(request.workspace_id, user)
+    try:
+        ws_path = workspace_manager.get_workspace_path(request.workspace_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    meta = workspace_manager.get_workspace_metadata(request.workspace_id) or {}
+    all_findings = meta.get("findings", [])
+    findings_by_id = {str(f.get("id")): f for f in all_findings if "id" in f}
+
+    if not request.finding_ids:
+        raise HTTPException(status_code=400, detail="No finding IDs provided for batch repair.")
+
+    # Check PR status & eligibility to prevent repairing already submitted or merged findings
+    token = resolve_github_token(user)
+    pr_status_map: Dict[str, Dict[str, Any]] = {}
+    if token and meta.get("owner") and meta.get("repo"):
+        try:
+            prs = github_service.list_repository_pull_requests(token, meta["owner"], meta["repo"], state="all")
+            pr_status_map = github_service.match_findings_to_pull_requests(all_findings, prs, workspace_meta=meta)
+        except Exception as e:
+            logger.warning(f"PR status check skipped or failed in batch repair: {e}")
+
+    test_cmd = request.test_command or meta.get("test_command")
+
+    # Initialize repository
+    try:
+        repo = Repo(ws_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Workspace is not a valid git repository: {e}")
+
+    # Checkpoint any pre-existing uncommitted or untracked changes to prevent rollback from discarding them
+    if repo.is_dirty(untracked_files=True):
+        repo.git.add("-A")
+        repo.index.commit("chore: checkpoint workspace state prior to batch repair")
+
+    initial_sha = repo.head.commit.hexsha
+    results: List[Dict[str, Any]] = []
+    successful_findings: List[Dict[str, Any]] = []
+
+    for fid in request.finding_ids:
+        fid_str = str(fid)
+        if fid_str not in findings_by_id:
+            results.append({
+                "finding_id": fid_str,
+                "title": f"Finding {fid_str}",
+                "status": "failed",
+                "verification_status": "NOT_FOUND",
+                "error": f"Finding '{fid_str}' not found in workspace findings.",
+                "patch": "",
+                "test_details": None
+            })
+            continue
+
+        finding = findings_by_id[fid_str]
+        title = finding.get("title", f"Finding {fid_str}")
+
+        # Check eligibility against PR status
+        pr_info = pr_status_map.get(fid_str)
+        if pr_info and not pr_info.get("is_eligible_for_repair", True):
+            results.append({
+                "finding_id": fid_str,
+                "title": title,
+                "status": "skipped",
+                "verification_status": "SKIPPED",
+                "error": pr_info.get("ineligibility_reason") or "Finding is not eligible for repair (already submitted or merged).",
+                "patch": "",
+                "test_details": None
+            })
+            continue
+
+        # Checkpoint current git state before attempting patch
+        checkpoint_sha = repo.head.commit.hexsha
+
+        # Synthesize diagnosis context
+        files = finding.get("files", [])
+        fault_file = files[0] if files else ""
+        diag_ctx = {
+            "fault_file": fault_file,
+            "root_cause": f"[{title}] {finding.get('explanation', '')}. Evidence: {finding.get('evidence', '')}",
+            "fix_strategy": finding.get("proposed_fix") or finding.get("action") or "Apply minimal corrective patch.",
+            "confidence": finding.get("confidence", "high"),
+            "files_to_modify": files
+        }
+
+        # Build fresh code context (takes into account previous successful repairs)
+        focus_files = files if files else ([fault_file] if fault_file else None)
+        code_ctx = build_context(ws_path, focus_files=focus_files)
+
+        # Generate patch
+        try:
+            patch = nebius_client.generate_patch(diag_ctx, code_ctx)
+        except Exception as e:
+            repo.git.reset("--hard", checkpoint_sha)
+            repo.git.clean("-fd")
+            results.append({
+                "finding_id": fid_str,
+                "title": title,
+                "status": "failed",
+                "verification_status": "PATCH GENERATION FAILED",
+                "error": f"Patch synthesis failed: {str(e)}",
+                "patch": "",
+                "test_details": None
+            })
+            continue
+
+        if not patch:
+            repo.git.reset("--hard", checkpoint_sha)
+            repo.git.clean("-fd")
+            results.append({
+                "finding_id": fid_str,
+                "title": title,
+                "status": "failed",
+                "verification_status": "PATCH GENERATION FAILED",
+                "error": "Model returned an empty patch.",
+                "patch": "",
+                "test_details": None
+            })
+            continue
+
+        # Safely apply patch
+        applied = PatchEngine.apply_patch(ws_path, patch)
+        if not applied:
+            repo.git.reset("--hard", checkpoint_sha)
+            repo.git.clean("-fd")
+            results.append({
+                "finding_id": fid_str,
+                "title": title,
+                "status": "failed",
+                "verification_status": "APPLY FAILED",
+                "error": "Failed to apply patch cleanly or unidiff validation failed.",
+                "patch": patch,
+                "test_details": None
+            })
+            continue
+
+        # Run verification tests
+        test_details = None
+        verification_status = "UNVERIFIED"
+        if test_cmd:
+            test_details = workspace_manager.run_tests(request.workspace_id, test_cmd)
+            if test_details.get("returncode") == 0 and test_details.get("success") is True:
+                verification_status = "FIX VERIFIED"
+            elif test_details.get("returncode") == -1:
+                verification_status = "VERIFICATION INCOMPLETE"
+            else:
+                verification_status = "FIX FAILED"
+
+        # If tests failed, rollback this finding
+        if test_cmd and verification_status != "FIX VERIFIED":
+            repo.git.reset("--hard", checkpoint_sha)
+            repo.git.clean("-fd")
+            results.append({
+                "finding_id": fid_str,
+                "title": title,
+                "status": "rolled_back",
+                "verification_status": verification_status,
+                "error": f"Verification failed with exit code {test_details.get('returncode')}. Patch safely rolled back.",
+                "patch": patch,
+                "test_details": test_details
+            })
+            continue
+
+        # Commit clean fix to repo
+        clean_msg = format_commit_title(f"fix: {title}")
+        repo.git.add("-A")
+        repo.index.commit(clean_msg)
+        new_sha = repo.head.commit.hexsha
+
+        successful_findings.append(finding)
+        results.append({
+            "finding_id": fid_str,
+            "title": title,
+            "status": "verified" if verification_status == "FIX VERIFIED" else "repaired",
+            "verification_status": verification_status,
+            "patch": patch,
+            "commit_sha": new_sha,
+            "test_details": test_details
+        })
+
+    # Cumulative diff from initial SHA to current HEAD
+    try:
+        cumulative_diff = repo.git.diff(initial_sha, repo.head.commit.hexsha)
+    except Exception:
+        cumulative_diff = ""
+
+    num_total = len(request.finding_ids)
+    num_successful = sum(1 for r in results if r["status"] in ("verified", "repaired"))
+    num_failed = sum(1 for r in results if r["status"] in ("failed", "rolled_back"))
+    num_skipped = sum(1 for r in results if r["status"] == "skipped")
+
+    all_succeeded = (num_successful == num_total) and (num_failed == 0) and (num_skipped == 0)
+    batch_status = "success" if all_succeeded else ("partial_success" if num_successful > 0 else "failed")
+    overall_verification = "FIX VERIFIED" if (all_succeeded and test_cmd) else ("PARTIAL FIX" if num_successful > 0 else "FIX FAILED")
+
+    workspace_manager.update_workspace_metadata(
+        request.workspace_id,
+        {
+            "batch_results": results,
+            "batch_repaired_findings": successful_findings,
+            "batch_repaired_finding_ids": [r["finding_id"] for r in results if r["status"] in ("verified", "repaired")],
+            "patch": cumulative_diff,
+            "patch_applied": num_successful > 0,
+            "verification_status": overall_verification,
+            "user_id": user.id if user else None
+        }
+    )
+
+    if user and supabase_manager.is_configured and num_successful > 0:
+        supabase_manager.save_repair_session(
+            user_id=user.id,
+            session_data={
+                "workspace_id": request.workspace_id,
+                "repo_url": meta.get("clone_url") or meta.get("repo_url") or "",
+                "issue_description": f"Batch repair: {num_successful}/{num_total} findings resolved",
+                "mode": "batch",
+                "status": "verified" if all_succeeded else "partial",
+                "findings": successful_findings,
+                "patch": cumulative_diff,
+                "verification_status": overall_verification,
+                "verification_details": {"batch_summary": {"total": num_total, "successful": num_successful, "failed": num_failed, "skipped": num_skipped}}
+            }
+        )
+
+    return {
+        "status": batch_status,
+        "all_succeeded": all_succeeded,
+        "summary": {
+            "total": num_total,
+            "successful": num_successful,
+            "failed": num_failed,
+            "skipped": num_skipped
+        },
+        "results": results,
+        "cumulative_patch": cumulative_diff
+    }
 
 # ---------------------------------------------------------
 # User Repair History Endpoints

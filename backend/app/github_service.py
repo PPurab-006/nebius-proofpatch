@@ -11,6 +11,15 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 import httpx
 from git import Repo
+from backend.app.reporting import (
+    format_pull_request_body,
+    format_commit_message,
+    format_pr_title,
+    clean_prose,
+    compute_finding_fingerprint,
+    extract_finding_fingerprints_from_pr_body,
+    extract_finding_ids_from_pr_body
+)
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +337,9 @@ class GitHubService:
         verification_details: Optional[Dict[str, Any]],
         model_name: str,
         is_mock_mode: bool,
-        custom_notes: Optional[str] = None
+        custom_notes: Optional[str] = None,
+        finding_fingerprints: Optional[List[str]] = None,
+        finding_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Safely commits changes to a new unique repair branch, pushes to remote, and opens a Pull Request.
@@ -356,7 +367,8 @@ class GitHubService:
         if diff_check.returncode == 0:
             raise ValueError("No changes detected in workspace to commit.")
 
-        commit_msg = f"fix: {title}\n\nAutonomously repaired and verified by Patchworks."
+        clean_title = format_pr_title(title)
+        commit_msg = format_commit_message(clean_title, problem_summary)
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=workspace_path, check=True, capture_output=True)
 
         head_commit_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=workspace_path, capture_output=True, text=True, check=True)
@@ -384,7 +396,7 @@ class GitHubService:
 
         # 5. Build structured Pull Request markdown body
         pr_body = self._build_pr_body(
-            title=title,
+            title=clean_title,
             problem_summary=problem_summary,
             diagnosis_data=diagnosis_data,
             verification_details=verification_details,
@@ -393,13 +405,15 @@ class GitHubService:
             new_branch=new_branch,
             target_branch=target_branch,
             commit_sha=commit_sha,
-            custom_notes=custom_notes
+            custom_notes=custom_notes,
+            finding_fingerprints=finding_fingerprints,
+            finding_ids=finding_ids
         )
 
         # 6. Create Pull Request via GitHub REST API
         headers = self._get_headers(token)
         payload = {
-            "title": title,
+            "title": clean_title,
             "head": new_branch,
             "base": target_branch,
             "body": pr_body,
@@ -459,59 +473,220 @@ class GitHubService:
         new_branch: str,
         target_branch: str,
         commit_sha: str,
-        custom_notes: Optional[str] = None
+        custom_notes: Optional[str] = None,
+        finding_fingerprints: Optional[List[str]] = None,
+        finding_ids: Optional[List[str]] = None
     ) -> str:
-        files_list = "\n".join([f"- `{f}`" for f in diagnosis_data.get("files_to_modify", [])]) or "- None specified"
-        test_stdout = verification_details.get("stdout", "").strip() if verification_details else "No test stdout"
-        if len(test_stdout) > 2500:
-            test_stdout = test_stdout[:2500] + "\n... [Output truncated for pull request]"
-
-        mode_badge = (
-            "> ⚠️ **Execution Mode:** Simulated Mock Mode (Testing Simulation)"
-            if is_mock_mode
-            else f"> ⚡ **Execution Mode:** Live Nebius AI Cloud &bull; Model: `{model_name}`"
+        return format_pull_request_body(
+            title=title,
+            problem_summary=problem_summary,
+            diagnosis_data=diagnosis_data,
+            verification_details=verification_details,
+            model_name=model_name,
+            is_mock_mode=is_mock_mode,
+            new_branch=new_branch,
+            target_branch=target_branch,
+            commit_sha=commit_sha,
+            custom_notes=custom_notes,
+            finding_fingerprints=finding_fingerprints,
+            finding_ids=finding_ids
         )
 
-        notes_section = f"### 📝 Additional Review Notes\n{custom_notes}\n" if custom_notes else ""
+    def list_repository_pull_requests(
+        self,
+        token: str,
+        owner: str,
+        repo: str,
+        state: str = "all",
+        per_page: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        List pull requests for a given repository.
+        Returns a structured list of pull requests with normalized fields:
+        number, title, state, is_merged, merged_at, closed_at, html_url, body, head_branch, base_branch.
+        """
+        if not REPO_NAME_REGEX.match(owner) or not REPO_NAME_REGEX.match(repo):
+            raise ValueError("Invalid owner or repository name")
 
-        return f"""## 🛠️ Patchworks Verified Code Repair
+        headers = self._get_headers(token)
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                res = client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                    headers=headers,
+                    params={
+                        "state": state,
+                        "sort": "updated",
+                        "direction": "desc",
+                        "per_page": min(per_page, 100)
+                    }
+                )
+                if res.status_code == 200:
+                    prs: List[Dict[str, Any]] = []
+                    for p in res.json():
+                        prs.append({
+                            "number": p.get("number"),
+                            "title": p.get("title", ""),
+                            "state": p.get("state", "open"),
+                            "is_merged": p.get("merged_at") is not None,
+                            "merged_at": p.get("merged_at"),
+                            "closed_at": p.get("closed_at"),
+                            "html_url": p.get("html_url"),
+                            "body": p.get("body") or "",
+                            "head_branch": p.get("head", {}).get("ref", ""),
+                            "base_branch": p.get("base", {}).get("ref", ""),
+                            "user_login": p.get("user", {}).get("login", "")
+                        })
+                    return prs
+                elif res.status_code == 401:
+                    raise ValueError("Invalid or expired GitHub credentials")
+                elif res.status_code == 403:
+                    raise ValueError("GitHub API rate limit exceeded or access forbidden")
+                elif res.status_code == 404:
+                    raise ValueError("Repository not found or access denied")
+                else:
+                    raise ValueError(f"GitHub API error ({res.status_code}): {res.text}")
+        except httpx.RequestError as e:
+            logger.error(f"Failed to fetch pull requests: {e}")
+            raise ValueError(f"Unable to contact GitHub API: {str(e)}")
 
-{mode_badge}
+    def match_findings_to_pull_requests(
+        self,
+        findings: List[Dict[str, Any]],
+        pull_requests: List[Dict[str, Any]],
+        workspace_meta: Optional[Dict[str, Any]] = None,
+        repair_sessions: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Associate findings with existing repository pull requests.
+        Differentiates confident matches (fingerprint match, session link, branch match)
+        from uncertain matches (e.g. same file in an open PR without fingerprint confirmation).
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+        workspace_meta = workspace_meta or {}
+        repair_sessions = repair_sessions or []
 
-### 📋 Overview
-{problem_summary}
+        published_pr = workspace_meta.get("published_pr") or {}
+        current_published_pr_num = published_pr.get("pr_number")
 
----
+        session_pr_nums: Dict[int, Dict[str, Any]] = {}
+        for s in repair_sessions:
+            p_num = s.get("pr_number")
+            if p_num:
+                session_pr_nums[p_num] = s
 
-### 🔍 Root Cause Diagnosis
-{diagnosis_data.get("diagnosis", "Autonomous diagnosis performed.")}
+        for finding in findings:
+            f_id = str(finding.get("id", ""))
+            f_fingerprint = compute_finding_fingerprint(finding)
+            files = [str(f).strip().lower() for f in finding.get("files", []) if str(f).strip()]
+            basenames = [os.path.basename(f) for f in files if f]
 
-**Evidence:**
-> {diagnosis_data.get("evidence", "Code context analysis")}
+            matched_pr: Optional[Dict[str, Any]] = None
+            match_confidence = "none"
 
-**Target Files Modified:**
-{files_list}
+            # 1. Confident match search across pull requests
+            for pr in pull_requests:
+                pr_body = pr.get("body", "")
+                pr_fps = extract_finding_fingerprints_from_pr_body(pr_body)
+                pr_fids = extract_finding_ids_from_pr_body(pr_body)
+                pr_num = pr.get("number")
+                pr_branch = pr.get("head_branch", "")
 
-**Proposed Solution Approach:**
-{diagnosis_data.get("proposed_fix_description", "Targeted minimal unified diff.")}
+                # 1.a Direct finding fingerprint match
+                if f_fingerprint and f_fingerprint in pr_fps:
+                    matched_pr = pr
+                    match_confidence = "exact_fingerprint"
+                    break
 
----
+                # 1.b Finding ID matched in patchworks-authored PR body
+                if f_id and f_id in pr_fids and pr_branch.startswith("patchworks/"):
+                    matched_pr = pr
+                    match_confidence = "exact_fingerprint"
+                    break
 
-### 🧪 Empirical Verification Results
-- **Status:** **`FIX VERIFIED`** (Tests successfully passed with exit code 0)
-- **Exit Code:** `{verification_details.get("returncode", 0) if verification_details else 0}`
-- **Sandbox Test Output:**
-```
-{test_stdout}
-```
+                # 1.c Current workspace published PR match
+                if current_published_pr_num and current_published_pr_num == pr_num:
+                    repaired_id = workspace_meta.get("repaired_finding_id") or workspace_meta.get("selected_finding", {}).get("id")
+                    batch_ids = workspace_meta.get("batch_repaired_finding_ids", [])
+                    if f_id and (f_id == repaired_id or f_id in batch_ids):
+                        matched_pr = pr
+                        match_confidence = "session_link"
+                        break
 
----
+                # 1.d Past session match in repair_sessions
+                if pr_num in session_pr_nums:
+                    sess = session_pr_nums[pr_num]
+                    sess_findings = sess.get("findings") or []
+                    sess_fids = [str(sf.get("id")) for sf in sess_findings if isinstance(sf, dict)]
+                    sess_fps = [compute_finding_fingerprint(sf) for sf in sess_findings if isinstance(sf, dict)]
+                    if (f_id and f_id in sess_fids) or (f_fingerprint and f_fingerprint in sess_fps):
+                        matched_pr = pr
+                        match_confidence = "session_link"
+                        break
 
-### ⚠️ Regression Risk Assessment
-{diagnosis_data.get("regression_risks", "Low regression risk determined through targeted test coverage.")}
+            # 2. If no confident match, check for uncertain / possible PR match
+            if not matched_pr:
+                for pr in pull_requests:
+                    if pr.get("state") != "open":
+                        continue
 
-{notes_section}
----
-*Created autonomously with [Patchworks](https://github.com/PPurab-006/nebius-proofpatch) &bull; Find the fault. Forge the fix. Prove it works.*
-*Branch:* `{new_branch}` &bull; *Target:* `{target_branch}` &bull; *Commit:* `{commit_sha[:8]}`
-"""
+                    pr_text = f"{pr.get('title', '')} {pr.get('body', '')}".lower()
+
+                    file_matched = any(b in pr_text for b in basenames)
+                    if not file_matched:
+                        continue
+
+                    title_words = [
+                        w for w in re.findall(r"[a-z0-9_-]{4,}", (finding.get("title") or "").lower())
+                        if w not in {"with", "from", "that", "this", "have", "error", "issue", "defect", "fail", "code"}
+                    ]
+                    keyword_matches = sum(1 for w in title_words if w in pr_text)
+                    if file_matched and (keyword_matches >= 1):
+                        matched_pr = pr
+                        match_confidence = "uncertain"
+                        break
+
+            # 3. Lifecycle and badge status determination
+            if matched_pr and match_confidence in ("exact_fingerprint", "session_link"):
+                if matched_pr.get("is_merged") or matched_pr.get("merged_at"):
+                    lifecycle_status = "merged"
+                    badge_status = "MERGED"
+                    is_eligible = False
+                    reason = f"Already merged in PR #{matched_pr.get('number')}"
+                elif matched_pr.get("state") == "open":
+                    lifecycle_status = "pr_open"
+                    badge_status = "PR OPEN"
+                    is_eligible = False
+                    reason = f"Already submitted in open PR #{matched_pr.get('number')}"
+                else:
+                    lifecycle_status = "closed"
+                    badge_status = "PR CLOSED"
+                    is_eligible = True
+                    reason = None
+            elif matched_pr and match_confidence == "uncertain":
+                lifecycle_status = "possible_pr"
+                badge_status = "POSSIBLE EXISTING PR"
+                is_eligible = True
+                reason = None
+            else:
+                lifecycle_status = "ready"
+                badge_status = "READY"
+                is_eligible = True
+                reason = None
+
+            results[f_id] = {
+                "finding_id": f_id,
+                "fingerprint": f_fingerprint,
+                "lifecycle_status": lifecycle_status,
+                "badge_status": badge_status,
+                "pr_number": matched_pr.get("number") if matched_pr else None,
+                "pr_url": matched_pr.get("html_url") if matched_pr else None,
+                "confidence": match_confidence,
+                "is_merged": matched_pr.get("is_merged", False) if matched_pr else False,
+                "is_open": (matched_pr.get("state") == "open") if matched_pr else False,
+                "is_eligible_for_repair": is_eligible,
+                "ineligibility_reason": reason
+            }
+
+        return results
+
