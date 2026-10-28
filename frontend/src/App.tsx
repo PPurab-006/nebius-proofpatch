@@ -418,6 +418,7 @@ export default function App() {
       const { error } = await supabase.auth.signInWithOAuth({
         provider: 'github',
         options: {
+          scopes: 'repo read:user',
           redirectTo: window.location.origin,
         },
       });
@@ -519,24 +520,47 @@ export default function App() {
     }
 
     if (supabase) {
-      supabase.auth.getSession().then(({ data: { session } }) => {
+      supabase.auth.getSession().then(async ({ data: { session } }) => {
         if (session?.user) {
           setUser({
             id: session.user.id,
             email: session.user.email,
             avatar_url: session.user.user_metadata?.avatar_url,
           });
+          if (session.provider_token) {
+            try {
+              await axios.post(
+                '/api/github/connect',
+                { token: session.provider_token },
+                { headers: { Authorization: `Bearer ${session.access_token}` } }
+              );
+            } catch (e) {
+              console.warn('Auto-connecting GitHub provider token:', e);
+            }
+          }
           fetchPersistentHistory();
+          fetchGitHubStatus();
         }
       });
 
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
         if (session?.user) {
           setUser({
             id: session.user.id,
             email: session.user.email,
             avatar_url: session.user.user_metadata?.avatar_url,
           });
+          if (session.provider_token) {
+            try {
+              await axios.post(
+                '/api/github/connect',
+                { token: session.provider_token },
+                { headers: { Authorization: `Bearer ${session.access_token}` } }
+              );
+            } catch (e) {
+              console.warn('Auto-connecting GitHub provider token:', e);
+            }
+          }
           fetchGitHubStatus();
           fetchPersistentHistory();
         } else {
