@@ -108,14 +108,24 @@ def extract_unified_diff(content: str) -> str:
 
     text = content.strip()
 
-    # 0. Check if content is a JSON object with a patch field
-    if text.startswith("{") and "patch" in text:
+    # 0. Check if content is or contains a JSON object with a patch field (even if JSON is truncated)
+    if "patch" in text:
         try:
             data = json.loads(text)
             if isinstance(data, dict) and "patch" in data and isinstance(data["patch"], str):
                 text = data["patch"].strip()
         except Exception:
-            pass
+            m = re.search(r'"patch"\s*:\s*"(.*)', text, re.DOTALL)
+            if m:
+                val = m.group(1).rstrip()
+                if val.endswith('"}'):
+                    val = val[:-2]
+                elif val.endswith('"'):
+                    val = val[:-1]
+                try:
+                    text = json.loads(f'"{val}"')
+                except Exception:
+                    text = val.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
 
     # 1. First look for any fenced code block that contains a diff header
     fence_matches = list(re.finditer(r"```(?:diff|patch)?\s*\n(.*?)\n```", text, re.DOTALL | re.IGNORECASE))
@@ -322,7 +332,11 @@ Respond ONLY with a valid JSON object matching this schema:
             return self._mock_generate_patch(diagnosis_context, code_context)
 
         prompt = f"""You are an autonomous code repair engine.
-Provide a minimal git unified diff patch to fix the defect described in the diagnosis.
+CRITICAL REPAIR RULES:
+1. STRICT LOCAL SCOPE: Provide a MINIMAL targeted git unified diff ONLY for the specific function or lines indicated in the diagnosis evidence.
+2. DO NOT refactor the entire file, DO NOT touch other endpoints, and DO NOT add new dependencies across multiple routes. Fix only the immediate local defect.
+3. CONCISE DIFF: Keep the patch compact (typically 5 to 30 lines of diff).
+4. VALID UNIFIED DIFF: Ensure correct file headers (--- a/<path> and +++ b/<path>), proper hunk headers (@@ ... @@), and exact code context matching the provided code.
 
 Diagnosis:
 {json.dumps(diagnosis_context, indent=2)}
@@ -348,7 +362,7 @@ Respond ONLY with a JSON object:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                max_tokens=3072,
+                max_tokens=4096,
                 **extra_kwargs
             )
 
