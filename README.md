@@ -1,6 +1,15 @@
-# Patchworks
-
-> **Nebius × NVIDIA Global AI Hackathon** &bull; *Find the fault. Forge the fix. Prove it works.*
+<div align="center">
+  <img src="frontend/public/patchworks-horizontal.png" alt="Patchworks" width="380" />
+  <br />
+  <br />
+  <p><strong>Nebius &times; NVIDIA Global AI Hackathon</strong> &bull; <em>Find the fault. Forge the fix. Prove it works.</em></p>
+  <p>
+    <a href="https://patchworks-workbench.onrender.com"><img src="https://img.shields.io/badge/Live%20Workbench-Online-B7FF3C?style=flat-square" alt="Live Workbench" /></a>
+    <img src="https://img.shields.io/badge/Inference-Nebius%20Token%20Factory-00E5FF?style=flat-square" alt="Inference" />
+    <img src="https://img.shields.io/badge/Model-NVIDIA%20Nemotron--70B-76B900?style=flat-square&logo=nvidia" alt="Model" />
+    <img src="https://img.shields.io/badge/Auth%20%26%20Vault-Supabase-3ECF8E?style=flat-square&logo=supabase" alt="Supabase" />
+  </p>
+</div>
 
 ---
 

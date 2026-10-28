@@ -1188,24 +1188,20 @@ ${
           {/* Logo Header */}
           <div className="p-4 border-b border-[#242820] flex items-center justify-between">
             {sidebarOpen ? (
-              <div className="flex items-center gap-3">
-                <div className="w-8 h-8 rounded border border-[#242820] bg-[#11140F] flex items-center justify-center glow-lime-sm">
-                  <div className="w-3.5 h-3.5 border-2 border-[#B7FF3C] rotate-45 flex items-center justify-center">
-                    <div className="w-1 h-1 bg-[#B7FF3C]" />
-                  </div>
-                </div>
-                <div>
-                  <span className="font-bold tracking-wider text-sm text-[#F4F5F0] uppercase font-mono">
-                    Patchworks
-                  </span>
-                  <p className="text-[10px] text-[#969B90] font-mono leading-none mt-0.5">
-                    AUTONOMOUS REPAIR
-                  </p>
-                </div>
+              <div className="flex items-center gap-2">
+                <img
+                  src="/patchworks-horizontal.png"
+                  alt="Patchworks"
+                  className="h-7 w-auto object-contain drop-shadow-[0_0_12px_rgba(183,255,60,0.18)]"
+                />
               </div>
             ) : (
-              <div className="mx-auto w-8 h-8 rounded border border-[#242820] bg-[#11140F] flex items-center justify-center glow-lime-sm">
-                <div className="w-3.5 h-3.5 border-2 border-[#B7FF3C] rotate-45" />
+              <div className="mx-auto flex items-center justify-center">
+                <img
+                  src="/patchworks-icon.png"
+                  alt="Patchworks"
+                  className="w-7 h-7 object-contain drop-shadow-[0_0_8px_rgba(183,255,60,0.25)]"
+                />
               </div>
             )}
             <button
@@ -2450,8 +2446,13 @@ ${
               ) : (
                 /* Empty State */
                 <div className="h-full border border-[#242820] bg-[#0B0D0A] rounded-lg p-8 flex flex-col items-center justify-center text-center space-y-4 engineering-grid min-h-[420px]">
-                  <div className="w-12 h-12 rounded-lg border border-[#242820] bg-[#11140F] flex items-center justify-center glow-lime-sm">
-                    <Shield className="w-6 h-6 text-[#B7FF3C]" />
+                  <div className="relative group">
+                    <div className="absolute -inset-1.5 rounded-2xl bg-gradient-to-b from-[#B7FF3C]/20 to-transparent blur-md group-hover:from-[#B7FF3C]/35 transition duration-500 opacity-80" />
+                    <img
+                      src="/patchworks-squircle.png"
+                      alt="Patchworks Workbench"
+                      className="relative w-16 h-16 rounded-xl object-contain drop-shadow-[0_0_20px_rgba(183,255,60,0.25)]"
+                    />
                   </div>
                   <div className="max-w-md space-y-1.5">
                     <h3 className="text-sm font-mono uppercase tracking-wider text-[#F4F5F0] font-bold">
@@ -2519,7 +2520,7 @@ ${
           <div className="bg-[#0B0D0A] border border-[#242820] p-6 rounded-lg max-w-md w-full space-y-4">
             <div className="flex items-center justify-between border-b border-[#242820] pb-3">
               <h4 className="text-xs font-mono uppercase tracking-wider text-[#F4F5F0] flex items-center gap-2">
-                <Sliders className="w-4 h-4 text-[#B7FF3C]" />
+                <img src="/patchworks-icon.png" alt="Patchworks" className="w-4 h-4 object-contain" />
                 Patchworks Engine Configuration
               </h4>
               <button onClick={() => setSettingsOpen(false)} className="text-[#969B90] hover:text-[#F4F5F0]">
@@ -2805,8 +2806,8 @@ NEBIUS_MODEL_NAME="nvidia/Nemotron-3_5-Lightning"`}
         <div className="fixed inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center z-50 p-4">
           <div className="bg-[#0B0D0A] border border-[#242820] p-6 rounded-lg max-w-md w-full space-y-4 glow-lime-sm">
             <div className="flex items-center justify-between border-b border-[#242820] pb-3">
-              <div className="flex items-center gap-2 text-[#F4F5F0]">
-                <User className="w-5 h-5 text-[#B7FF3C]" />
+              <div className="flex items-center gap-2.5 text-[#F4F5F0]">
+                <img src="/patchworks-icon.png" alt="Patchworks" className="w-5 h-5 object-contain" />
                 <h4 className="text-sm font-mono uppercase font-bold">
                   {authMode === 'signup'
                     ? 'Create Patchworks Account'
