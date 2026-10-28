@@ -90,3 +90,18 @@ def test_frontend_serving():
     assert "text/html" in response.headers.get("content-type", "")
     assert "Patchworks" in response.text or "vite" in response.text.lower() or "html" in response.text.lower()
 
+def test_engine_model_endpoints():
+    res = client.get("/api/engine/models")
+    assert res.status_code == 200
+    data = res.json()
+    assert "models" in data
+    assert any(m["id"] == "nvidia/nemotron-3-super-120b-a12b" for m in data["models"])
+
+    res_set = client.post("/api/engine/model", json={"model": "nvidia/nemotron-3-super-120b-a12b"})
+    assert res_set.status_code == 200
+    assert res_set.json()["active_model"] == "nvidia/nemotron-3-super-120b-a12b"
+
+    res_invalid = client.post("/api/engine/model", json={"model": "unsupported-model-id"})
+    assert res_invalid.status_code == 400
+
+

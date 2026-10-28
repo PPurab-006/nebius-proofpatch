@@ -226,6 +226,55 @@ async def health_check():
         "model": nebius_client.model_name
     }
 
+class SetModelRequest(BaseModel):
+    model: str
+
+ALLOWED_NEMOTRON_MODELS = [
+    {
+        "id": "nvidia/nemotron-3-super-120b-a12b",
+        "name": "Nemotron 3 Super (120B MoE)",
+        "description": "Specialized for multi-step code synthesis, planning, and agentic workflows.",
+        "badge": "Recommended for Code"
+    },
+    {
+        "id": "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "name": "Nemotron 3 Ultra (550B)",
+        "description": "NVIDIA flagship high-capacity reasoning model for complex architectural analysis.",
+        "badge": "Flagship Reasoning"
+    },
+    {
+        "id": "nvidia/Nemotron-3_5-Lightning",
+        "name": "Nemotron 3.5 Lightning",
+        "description": "High-throughput, low-latency reasoning for fast turnaround.",
+        "badge": "Fast / Lightweight"
+    },
+    {
+        "id": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B",
+        "name": "Nemotron 3 Nano (30B)",
+        "description": "Compact parameter model optimized for edge and rapid triage calls.",
+        "badge": "Compact / Economy"
+    }
+]
+
+@app.get("/api/engine/models")
+async def list_models():
+    return {
+        "active_model": nebius_client.model_name,
+        "models": ALLOWED_NEMOTRON_MODELS
+    }
+
+@app.post("/api/engine/model")
+async def set_model(req: SetModelRequest):
+    allowed_ids = [m["id"] for m in ALLOWED_NEMOTRON_MODELS]
+    if req.model not in allowed_ids:
+        raise HTTPException(status_code=400, detail=f"Model '{req.model}' is not in allowed Nemotron models.")
+    nebius_client.model_name = req.model
+    logger.info(f"Switched active Nebius inference model to {req.model}")
+    return {
+        "status": "success",
+        "active_model": nebius_client.model_name
+    }
+
 @app.post("/api/upload")
 def upload_zip(file: UploadFile = File(...), user: Optional[AuthUser] = Depends(get_optional_user)):
     if not file.filename.endswith('.zip'):

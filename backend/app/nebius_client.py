@@ -179,7 +179,7 @@ class NebiusClient:
     ):
         self.api_key = api_key if api_key is not None else os.getenv("NEBIUS_API_KEY", "mock_key")
         self.base_url = base_url if base_url is not None else os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
-        self.model_name = model_name if model_name is not None else os.getenv("NEBIUS_MODEL_NAME", "nvidia/Nemotron-3_5-Lightning")
+        self.model_name = model_name if model_name is not None else os.getenv("NEBIUS_MODEL_NAME", "nvidia/nemotron-3-super-120b-a12b")
         self.timeout = timeout if timeout is not None else float(os.getenv("NEBIUS_TIMEOUT", "60.0"))
 
         # Mock mode is active if api_key is empty, None, or 'mock_key'
@@ -204,7 +204,7 @@ class NebiusClient:
 
         self.api_key = os.getenv("NEBIUS_API_KEY", "mock_key")
         self.base_url = os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
-        self.model_name = os.getenv("NEBIUS_MODEL_NAME", "nvidia/Nemotron-3_5-Lightning")
+        self.model_name = os.getenv("NEBIUS_MODEL_NAME", "nvidia/nemotron-3-super-120b-a12b")
         self.timeout = float(os.getenv("NEBIUS_TIMEOUT", "60.0"))
         self.mock_mode = (not self.api_key) or (self.api_key.strip() in ["mock_key", ""])
 

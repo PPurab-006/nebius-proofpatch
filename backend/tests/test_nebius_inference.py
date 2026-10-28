@@ -27,7 +27,7 @@ def test_config_loading_defaults(monkeypatch):
     client = NebiusClient(api_key="mock_key")
     assert client.mock_mode is True
     assert client.base_url == "https://api.studio.nebius.ai/v1/"
-    assert client.model_name == "nvidia/Nemotron-3_5-Lightning"
+    assert client.model_name == "nvidia/nemotron-3-super-120b-a12b"
     assert client.client is None
 
 def test_config_loading_custom_env(monkeypatch):

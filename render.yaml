@@ -17,7 +17,7 @@ services:
       - key: NEBIUS_BASE_URL
         value: https://api.studio.nebius.ai/v1/
       - key: NEBIUS_MODEL_NAME
-        value: nvidia/Nemotron-3_5-Lightning
+        value: nvidia/nemotron-3-super-120b-a12b
       - key: NEBIUS_TIMEOUT
         value: "60.0"
       - key: CORS_ORIGINS

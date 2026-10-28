@@ -268,12 +268,41 @@ interface SessionRecord {
   branch?: string;
 }
 
+const AVAILABLE_NEMOTRON_MODELS = [
+  {
+    id: 'nvidia/nemotron-3-super-120b-a12b',
+    name: 'Nemotron 3 Super (120B MoE)',
+    tag: 'Recommended for Code',
+    description: 'Hybrid Mixture-of-Experts engineered for code generation, agentic repair, and multi-step planning.',
+  },
+  {
+    id: 'nvidia/Nemotron-3-Ultra-550b-a55b',
+    name: 'Nemotron 3 Ultra (550B)',
+    tag: 'Flagship Reasoning',
+    description: 'Flagship reasoning model for deep codebase analysis and complex structural refactoring.',
+  },
+  {
+    id: 'nvidia/Nemotron-3_5-Lightning',
+    name: 'Nemotron 3.5 Lightning',
+    tag: 'Fast / Lightweight',
+    description: 'Ultra low-latency throughput for fast triage and responsive interactive sessions.',
+  },
+  {
+    id: 'nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B',
+    name: 'Nemotron 3 Nano (30B)',
+    tag: 'Compact / Economy',
+    description: 'Lightweight model designed for edge inference and everyday routine tasks.',
+  },
+];
+
 export default function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rollbackModalOpen, setRollbackModalOpen] = useState(false);
   const [copiedWsId, setCopiedWsId] = useState(false);
+  const [switchingModel, setSwitchingModel] = useState(false);
+  const [modelSuccessMsg, setModelSuccessMsg] = useState('');
 
   // Ingestion inputs
   const [inputType, setInputType] = useState<'github' | 'git' | 'zip' | 'benchmark'>('github');
@@ -590,6 +619,33 @@ export default function App() {
       .catch((err) => {
         setError(`Failed to reach Patchworks API: ${err.message}`);
       });
+  };
+
+  const handleSwitchModel = async (newModel: string) => {
+    setSwitchingModel(true);
+    setModelSuccessMsg('');
+    try {
+      const res = await axios.post('/api/engine/model', { model: newModel });
+      if (res.data?.active_model) {
+        setHealth((prev) =>
+          prev
+            ? { ...prev, model: res.data.active_model }
+            : {
+                status: 'ok',
+                message: '',
+                nebius_configured: true,
+                supabase_configured: false,
+                model: res.data.active_model
+              }
+        );
+        setModelSuccessMsg(`Engine successfully switched to ${newModel}`);
+        setTimeout(() => setModelSuccessMsg(''), 4000);
+      }
+    } catch (err: any) {
+      setError(`Failed to switch model: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setSwitchingModel(false);
+    }
   };
 
   const fetchGitHubStatus = async () => {
@@ -3097,7 +3153,7 @@ ${
       {/* Settings & Engine Config Drawer */}
       {settingsOpen && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="bg-[#0B0D0A] border border-[#242820] p-6 rounded-lg max-w-md w-full space-y-4">
+          <div className="bg-[#0B0D0A] border border-[#242820] p-6 rounded-lg max-w-lg w-full space-y-4">
             <div className="flex items-center justify-between border-b border-[#242820] pb-3">
               <h4 className="text-xs font-mono uppercase tracking-wider text-[#F4F5F0] flex items-center gap-2">
                 <img src="/patchworks-icon.png" alt="Patchworks" className="w-4 h-4 object-contain" />
@@ -3108,41 +3164,83 @@ ${
               </button>
             </div>
 
-            <div className="space-y-3 text-xs font-mono">
+            <div className="space-y-4 text-xs font-mono">
               <div className="p-3 bg-[#11140F] rounded border border-[#242820] space-y-2">
-                <div className="flex justify-between">
+                <div className="flex justify-between items-center">
                   <span className="text-[#969B90]">Inference Provider:</span>
-                  <span className="text-[#F4F5F0]">Nebius AI Cloud</span>
+                  <span className="text-[#F4F5F0] font-bold">Nebius Token Factory</span>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-[#969B90]">Model Target:</span>
-                  <span className="text-[#B7FF3C]">{health?.model || 'nvidia/Nemotron-3_5-Lightning'}</span>
+                <div className="flex justify-between items-center">
+                  <span className="text-[#969B90]">Active Model:</span>
+                  <span className="text-[#B7FF3C] font-bold">{health?.model || 'nvidia/nemotron-3-super-120b-a12b'}</span>
                 </div>
-                <div className="flex justify-between">
+                <div className="flex justify-between items-center">
                   <span className="text-[#969B90]">Credentials Status:</span>
-                  <span className={health?.nebius_configured ? 'text-[#B7FF3C]' : 'text-[#F4BF50]'}>
-                    {health?.nebius_configured ? 'Configured (Live)' : 'Missing (Mock Mode)'}
+                  <span className={health?.nebius_configured ? 'text-[#B7FF3C] font-bold' : 'text-[#F4BF50]'}>
+                    {health?.nebius_configured ? 'Configured (Live Inference Active)' : 'Missing (Mock Mode)'}
                   </span>
                 </div>
               </div>
 
-              <div className="space-y-1.5 text-[11px] text-[#969B90] leading-relaxed">
-                <p>
-                  To switch from simulated mock mode to live inference, set <code className="text-[#F4F5F0]">NEBIUS_API_KEY</code> in{' '}
-                  <code className="text-[#F4F5F0]">.env</code>:
-                </p>
-                <pre className="bg-[#050505] p-2.5 rounded border border-[#242820] text-[#D4FF8A] overflow-x-auto">
-{`NEBIUS_API_KEY="your-nebius-token"
-NEBIUS_BASE_URL="https://api.studio.nebius.ai/v1/"
-NEBIUS_MODEL_NAME="nvidia/Nemotron-3_5-Lightning"`}
-                </pre>
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[11px] uppercase tracking-wider text-[#969B90] font-bold">
+                    Switch NVIDIA Nemotron Engine
+                  </span>
+                  {switchingModel && (
+                    <span className="text-[10px] text-[#B7FF3C] animate-pulse">Switching...</span>
+                  )}
+                </div>
+                <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                  {AVAILABLE_NEMOTRON_MODELS.map((m) => {
+                    const isActive = (health?.model || 'nvidia/nemotron-3-super-120b-a12b') === m.id;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => handleSwitchModel(m.id)}
+                        disabled={switchingModel}
+                        className={`w-full text-left p-2.5 rounded border transition-all cursor-pointer ${
+                          isActive
+                            ? 'bg-[#B7FF3C]/10 border-[#B7FF3C] shadow-[0_0_12px_rgba(183,255,60,0.15)]'
+                            : 'bg-[#11140F] border-[#242820] hover:border-[#969B90]/40'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <span className={`font-bold text-xs ${isActive ? 'text-[#B7FF3C]' : 'text-[#F4F5F0]'}`}>
+                            {m.name}
+                          </span>
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded uppercase font-bold font-mono ${
+                            isActive
+                              ? 'bg-[#B7FF3C] text-[#050505]'
+                              : 'bg-[#242820] text-[#969B90]'
+                          }`}>
+                            {isActive ? 'ACTIVE' : m.tag}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-[#969B90] leading-relaxed">
+                          {m.description}
+                        </p>
+                        <div className="mt-1 font-mono text-[10px] text-[#555A50]">
+                          {m.id}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
+
+              {modelSuccessMsg && (
+                <div className="p-2.5 bg-[#B7FF3C]/10 border border-[#B7FF3C]/30 rounded text-xs text-[#B7FF3C] font-mono">
+                  {modelSuccessMsg}
+                </div>
+              )}
             </div>
 
-            <div className="flex justify-end pt-2">
+            <div className="flex justify-end pt-2 border-t border-[#242820]">
               <button
                 onClick={() => setSettingsOpen(false)}
-                className="px-4 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] text-[#050505] text-xs font-mono font-bold"
+                className="px-4 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] text-[#050505] text-xs font-mono font-bold cursor-pointer"
               >
                 Close
               </button>
