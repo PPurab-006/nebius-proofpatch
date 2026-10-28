@@ -518,6 +518,9 @@ export default function App() {
       window.history.replaceState({}, '', window.location.pathname);
       fetchGitHubStatus();
     }
+    if (window.location.hash === '#') {
+      window.history.replaceState({}, '', window.location.pathname + window.location.search);
+    }
 
     if (supabase) {
       supabase.auth.getSession().then(async ({ data: { session } }) => {
