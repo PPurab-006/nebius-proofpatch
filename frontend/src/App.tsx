@@ -167,6 +167,7 @@ interface RepairResponse {
   patch_applied?: boolean;
   verification_status?: string;
   verification_details?: {
+    command?: string;
     success: boolean;
     stdout: string;
     stderr: string;
@@ -2442,7 +2443,7 @@ ${
                                   Verification Succeeded &bull; Ready to Publish
                                 </span>
                                 <p className="text-[11px] text-[#969B90] font-mono">
-                                  Empirically certified with exit code 0. Create repair branch & open PR.
+                                  Empirically certified{repair.verification_details?.command ? ` via ${repair.verification_details.command}` : ''} with exit code 0. Create repair branch & open PR.
                                 </p>
                               </div>
                               <button

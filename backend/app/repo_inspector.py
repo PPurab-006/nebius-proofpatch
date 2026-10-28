@@ -163,17 +163,13 @@ class RepoInspector:
                 except Exception as e:
                     logger.debug(f"Could not read README: {e}")
 
-        # 3. Detect framework and test command if not explicitly supplied
-        if not profile["test_command"]:
-            profile["test_command"] = RepoInspector._detect_test_command(real_ws_path, profile)
-
-        # 4. Identify core files (entrypoints, key source files, manifests, excluding duplicates & docs)
+        # 3. Identify core files (entrypoints, key source files, manifests, excluding duplicates & docs)
         core_files: List[str] = []
         seen_basenames = set()
 
         entrypoint_names = {
             "main.py", "app.py", "cli.py", "index.ts", "index.js", "server.ts",
-            "server.js", "lib.rs", "main.rs", "main.go", "extension.ts"
+            "server.js", "lib.rs", "main.rs", "main.go", "extension.ts", "index.html"
         }
 
         # 1. First pass: recognized entrypoints
@@ -210,53 +206,171 @@ class RepoInspector:
                     break
 
         profile["core_files"] = core_files
+
+        # 4. Detect framework and test command if not explicitly supplied
+        if not profile["test_command"]:
+            profile["test_command"] = RepoInspector._detect_test_command(real_ws_path, profile)
+
         return ProjectProfile(profile)
 
     @staticmethod
-    def _detect_test_command(workspace_path: str, profile: Dict[str, Any]) -> str:
-        """Infer safe test command based on manifests and language structure."""
-        # 1. package.json check
+    def resolve_verification_command(
+        workspace_path: str,
+        target_file: Optional[str] = None,
+        profile: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Infer or synthesize a safe, non-destructive verification command for the workspace
+        or for a specific target file being repaired.
+
+        Supports:
+        - Manifest-defined test suites: npm test, pytest, cargo test, go test
+        - Manifest build/lint suites: npm run build, npm run check, npm run lint
+        - Target-file syntax & compiler verification:
+            * JavaScript/Node: node --check <file>.js
+            * Python: pytest <targeted_test> or python3 -m py_compile <file>.py
+            * HTML: python3 -m html.parser <file>.html
+            * JSON: python3 -m json.tool <file>.json
+            * Rust: cargo check
+            * Go: go vet ./...
+        - Full-repo syntax fallbacks when no explicit tests exist:
+            * Python: python3 -m py_compile <entrypoint> or python3 -m compileall -q .
+            * JavaScript: node --check <primary_js_file>
+            * Static HTML: python3 -m html.parser index.html
+        """
+        # 1. Target-file specific verification if target_file is supplied
+        if target_file:
+            clean_target = os.path.normpath(target_file.replace("\\", "/")).lstrip("/")
+            if os.path.isfile(os.path.join(workspace_path, clean_target)):
+                # JavaScript / Node
+                if clean_target.endswith((".js", ".mjs", ".cjs")):
+                    return f"node --check {clean_target}"
+                
+                # Python
+                if clean_target.endswith((".py", ".pyw")):
+                    stem = os.path.splitext(os.path.basename(clean_target))[0]
+                    test_candidates = [
+                        f"test_{stem}.py",
+                        f"{stem}_test.py",
+                        f"tests/test_{stem}.py",
+                        f"backend/tests/test_{stem}.py",
+                        f"test/test_{stem}.py",
+                    ]
+                    for cand in test_candidates:
+                        if os.path.isfile(os.path.join(workspace_path, cand)):
+                            return f"pytest {cand}"
+                    return f"python3 -m py_compile {clean_target}"
+                
+                # HTML
+                if clean_target.endswith((".html", ".htm")):
+                    return f"python3 -m html.parser {clean_target}"
+                
+                # JSON
+                if clean_target.endswith(".json"):
+                    return f"python3 -m json.tool {clean_target}"
+                
+                # Rust
+                if clean_target.endswith(".rs"):
+                    return "cargo check"
+                
+                # Go
+                if clean_target.endswith(".go"):
+                    return "go vet ./..."
+
+        # 2. Check root package.json for test, check, lint, or build scripts
         pkg_json_path = os.path.join(workspace_path, "package.json")
         if os.path.isfile(pkg_json_path):
             try:
                 with open(pkg_json_path, "r", encoding="utf-8", errors="ignore") as f:
                     data = json.load(f)
                     scripts = data.get("scripts", {})
-                    if "test" in scripts and scripts["test"] != "echo \"Error: no test specified\" && exit 1":
+                    if "test" in scripts and "no test specified" not in scripts["test"] and scripts["test"].strip():
                         return "npm test"
+                    elif "check" in scripts and scripts["check"].strip():
+                        return "npm run check"
+                    elif "typecheck" in scripts and scripts["typecheck"].strip():
+                        return "npm run typecheck"
+                    elif "lint" in scripts and scripts["lint"].strip():
+                        return "npm run lint"
+                    elif "build" in scripts and scripts["build"].strip():
+                        return "npm run build"
             except Exception:
                 pass
 
-        # Check nested package.json (e.g. extension directory)
-        for manifest in profile.get("manifests", []):
+        # 3. Check nested package.json manifests (e.g. extension/ or frontend/)
+        manifests = (profile.get("manifests") if profile else []) or []
+        for manifest in manifests:
             if manifest.endswith("package.json"):
                 pkg_path = os.path.join(workspace_path, manifest)
                 try:
                     with open(pkg_path, "r", encoding="utf-8", errors="ignore") as f:
                         data = json.load(f)
                         scripts = data.get("scripts", {})
-                        if "test" in scripts and "no test specified" not in scripts["test"]:
-                            dir_name = os.path.dirname(manifest)
-                            return f"cd {dir_name} && npm test" if dir_name else "npm test"
+                        dir_name = os.path.dirname(manifest)
+                        prefix_arg = f"--prefix {dir_name} " if dir_name else ""
+                        if "test" in scripts and "no test specified" not in scripts["test"] and scripts["test"].strip():
+                            return f"npm {prefix_arg}test".strip()
+                        elif "check" in scripts and scripts["check"].strip():
+                            return f"npm {prefix_arg}run check".strip()
+                        elif "build" in scripts and scripts["build"].strip():
+                            return f"npm {prefix_arg}run build".strip()
                 except Exception:
                     pass
 
-        # 2. Python test files check
-        if "Python" in profile.get("languages", []) or any(f.endswith(".py") for f in profile.get("test_files", [])):
-            if profile.get("test_files"):
-                # If pytest files exist or simple tests
+        # 4. Python repository inspection
+        languages = (profile.get("languages") if profile else []) or []
+        test_files = (profile.get("test_files") if profile else []) or []
+        if "Python" in languages or any(f.endswith(".py") for f in test_files):
+            if test_files:
                 return "pytest"
-            return ""
+            # No dedicated test files found: synthesize compilation/syntax verification
+            core_files = (profile.get("core_files") if profile else []) or []
+            py_core = [f for f in core_files if f.endswith((".py", ".pyw"))]
+            if py_core:
+                entrypoints = [f for f in py_core if os.path.basename(f) in {"main.py", "app.py", "cli.py", "server.py"}]
+                target = entrypoints[0] if entrypoints else py_core[0]
+                return f"python3 -m py_compile {target}"
+            return "python3 -m compileall -q ."
 
-        # 3. Rust check
-        if "Rust" in profile.get("languages", []):
+        # 5. Vanilla JavaScript / Static Web project inspection
+        if "JavaScript" in languages:
+            core_files = (profile.get("core_files") if profile else []) or []
+            js_core = [f for f in core_files if f.endswith((".js", ".mjs", ".cjs"))]
+            if js_core:
+                entrypoints = [f for f in js_core if os.path.basename(f) in {"index.js", "main.js", "app.js", "server.js", "script.js"}]
+                target = entrypoints[0] if entrypoints else js_core[0]
+                return f"node --check {target}"
+            # Check for any .js file at workspace root
+            try:
+                for fname in sorted(os.listdir(workspace_path)):
+                    if fname.endswith((".js", ".mjs")) and os.path.isfile(os.path.join(workspace_path, fname)):
+                        return f"node --check {fname}"
+            except Exception:
+                pass
+
+        # 6. Static HTML projects (e.g. index.html canvas games, web apps)
+        if os.path.isfile(os.path.join(workspace_path, "index.html")):
+            return "python3 -m html.parser index.html"
+        if "HTML" in languages:
+            core_files = (profile.get("core_files") if profile else []) or []
+            html_core = [f for f in core_files if f.endswith((".html", ".htm"))]
+            if html_core:
+                return f"python3 -m html.parser {html_core[0]}"
+
+        # 7. Rust check
+        if "Rust" in languages:
             return "cargo test"
 
-        # 4. Go check
-        if "Go" in profile.get("languages", []):
+        # 8. Go check
+        if "Go" in languages:
             return "go test ./..."
 
         return ""
+
+    @staticmethod
+    def _detect_test_command(workspace_path: str, profile: Dict[str, Any]) -> str:
+        """Infer safe test command based on manifests and language structure."""
+        return RepoInspector.resolve_verification_command(workspace_path, target_file=None, profile=profile)
 
     @staticmethod
     def build_bounded_context(workspace_path: str, profile: Optional[Dict[str, Any]] = None, max_total_chars: int = 14000) -> str:

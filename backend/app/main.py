@@ -736,10 +736,20 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
         failure_reason = None
 
         # Resolve verification test command
-        test_cmd = request.test_command
+        test_cmd = (request.test_command or "").strip()
+        meta = workspace_manager.get_workspace_metadata(ws_id)
         if not test_cmd:
-            meta = workspace_manager.get_workspace_metadata(ws_id)
-            test_cmd = meta.get("test_command")
+            test_cmd = (meta.get("test_command") or "").strip()
+
+        # Intelligent verification detection if test_cmd is still not provided
+        if not test_cmd:
+            test_cmd = RepoInspector.resolve_verification_command(
+                workspace_path=ws_path,
+                target_file=target_hint,
+                profile=meta.get("profile")
+            )
+            if test_cmd:
+                logger.info(f"Intelligently detected verification command for repair: '{test_cmd}' (target: {target_hint})")
 
         if test_cmd:
             active_cmd = test_cmd
@@ -768,6 +778,7 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
             "verification_status": verification_result,
             "verification_details": test_details,
             "failure_reason": failure_reason,
+            "test_command": test_cmd or meta.get("test_command"),
             "user_id": user.id if user else None
         }
         if request.selected_finding:
@@ -1578,9 +1589,22 @@ def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends
         # Run verification tests
         test_details = None
         verification_status = "UNVERIFIED"
-        if test_cmd:
-            active_cmd = test_cmd
-            if test_cmd.strip() == "pytest":
+        active_cmd = (test_cmd or "").strip()
+        if not active_cmd:
+            meta = workspace_manager.get_workspace_metadata(request.workspace_id) or {}
+            active_cmd = (meta.get("test_command") or "").strip()
+        if not active_cmd:
+            meta = workspace_manager.get_workspace_metadata(request.workspace_id) or {}
+            active_cmd = RepoInspector.resolve_verification_command(
+                workspace_path=ws_path,
+                target_file=fault_file,
+                profile=meta.get("profile")
+            )
+            if active_cmd:
+                logger.info(f"Intelligently detected verification command in batch repair: '{active_cmd}' for {fault_file}")
+
+        if active_cmd:
+            if active_cmd.strip() == "pytest":
                 targeted = resolve_targeted_test(ws_path, fault_file)
                 if targeted:
                     active_cmd = f"pytest {targeted}"
@@ -1595,7 +1619,7 @@ def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends
                 verification_status = "FIX FAILED"
 
         # If tests failed, rollback this finding
-        if test_cmd and verification_status != "FIX VERIFIED":
+        if active_cmd and verification_status != "FIX VERIFIED":
             repo.git.reset("--hard", checkpoint_sha)
             repo.git.clean("-fd")
             results.append({

@@ -50,3 +50,23 @@ def test_run_tests_shell_injection(workspace_manager):
         result = workspace_manager.run_tests(ws_id, "pytest test.py; rm -rf /")
         assert result["success"] is False
         assert "unsafe characters" in result["stderr"]
+
+def test_run_tests_node_check(workspace_manager):
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'const a = 10;' > script.js && git add script.js && git commit -m 'Initial'")
+        ws_id = workspace_manager.create_workspace(f"file://{temp_repo}")
+
+        result = workspace_manager.run_tests(ws_id, "node --check script.js")
+        assert result["command"] == "node --check script.js"
+        assert result["success"] is True
+        assert result["returncode"] == 0
+
+def test_run_tests_python_compile(workspace_manager):
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'def foo(): pass' > mod.py && git add mod.py && git commit -m 'Initial'")
+        ws_id = workspace_manager.create_workspace(f"file://{temp_repo}")
+
+        result = workspace_manager.run_tests(ws_id, "python3 -m py_compile mod.py")
+        assert result["command"] == "python3 -m py_compile mod.py"
+        assert result["success"] is True
+        assert result["returncode"] == 0

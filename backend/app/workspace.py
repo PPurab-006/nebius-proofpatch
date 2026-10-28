@@ -344,6 +344,7 @@ class WorkspaceManager:
             cmd_args = shlex.split(command)
         except ValueError as e:
             return {
+                "command": command,
                 "success": False,
                 "stdout": "",
                 "stderr": f"Malformed command string: {e}",
@@ -352,6 +353,7 @@ class WorkspaceManager:
              
         if not cmd_args:
              return {
+                "command": command,
                 "success": False,
                 "stdout": "",
                 "stderr": "Empty command provided",
@@ -360,9 +362,10 @@ class WorkspaceManager:
 
         # Enforce explicit allowlist of base commands (no shell injection)
         base_cmd = cmd_args[0]
-        allowed_bases = ["pytest", "python", "python3"]
+        allowed_bases = ["pytest", "python", "python3", "npm", "node", "cargo", "go"]
         if base_cmd not in allowed_bases:
              return {
+                "command": command,
                 "success": False,
                 "stdout": "",
                 "stderr": f"Command '{base_cmd}' not allowed. Allowed bases: {', '.join(allowed_bases)}",
@@ -373,6 +376,7 @@ class WorkspaceManager:
         for arg in cmd_args:
             if any(char in arg for char in [';', '|', '&', '`', '$']):
                  return {
+                    "command": command,
                     "success": False,
                     "stdout": "",
                     "stderr": "Potentially unsafe characters in command arguments.",
@@ -398,11 +402,23 @@ class WorkspaceManager:
                 ] + list(cmd_args[1:])
             except ImportError:
                 return {
+                    "command": command,
                     "success": False,
                     "stdout": "",
                     "stderr": f"pytest is not installed in the active environment ({sys.executable}).",
                     "returncode": -1
                 }
+        elif base_cmd in ["npm", "node", "cargo", "go"]:
+            resolved_bin = shutil.which(base_cmd)
+            if not resolved_bin:
+                return {
+                    "command": command,
+                    "success": False,
+                    "stdout": "",
+                    "stderr": f"Command binary '{base_cmd}' is not installed or available on PATH in the sandbox environment.",
+                    "returncode": -1
+                }
+            exec_args[0] = resolved_bin
 
         # Construct isolated environment:
         # Prepend active interpreter bin to PATH and isolate PYTHONPATH strictly to the workspace
@@ -425,6 +441,7 @@ class WorkspaceManager:
                 timeout=test_timeout
             )
             return {
+                "command": command,
                 "success": result.returncode == 0,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
@@ -434,6 +451,7 @@ class WorkspaceManager:
              partial_out = te.stdout.decode("utf-8", errors="ignore") if isinstance(te.stdout, bytes) else (te.stdout or "")
              partial_err = te.stderr.decode("utf-8", errors="ignore") if isinstance(te.stderr, bytes) else (te.stderr or "")
              return {
+                "command": command,
                 "success": False,
                 "stdout": partial_out,
                 "stderr": f"Test execution timed out after {test_timeout} seconds\n{partial_err}".strip(),
@@ -441,6 +459,7 @@ class WorkspaceManager:
              }
         except Exception as e:
              return {
+                "command": command,
                 "success": False,
                 "stdout": "",
                 "stderr": f"Error running tests: {str(e)}",

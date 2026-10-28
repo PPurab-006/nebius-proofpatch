@@ -58,15 +58,54 @@ def test_repo_inspector_rust_cargo(temp_repo):
     assert profile.detected_test_command == "cargo test"
 
 def test_repo_inspector_missing_manifests_and_tests(temp_repo):
-    # Only a plain script without manifest or tests
+    # Plain script without manifest or formal test suite
     with open(os.path.join(temp_repo, "script.py"), "w") as f:
         f.write("print('hello')")
 
     profile = RepoInspector.inspect(temp_repo)
     assert "Python" in profile.languages
     assert profile.manifests == []
-    assert profile.detected_test_command is None
+    assert profile.detected_test_command == "python3 -m py_compile script.py"
     assert profile.test_files == []
+
+def test_repo_inspector_vanilla_javascript_node_check(temp_repo):
+    # Static JS project without package.json (e.g. Spaceman or browser scripts)
+    with open(os.path.join(temp_repo, "spaceman.js"), "w") as f:
+        f.write("console.log('spaceman game');")
+    with open(os.path.join(temp_repo, "index.html"), "w") as f:
+        f.write("<!DOCTYPE html><html><body><script src='spaceman.js'></script></body></html>")
+
+    profile = RepoInspector.inspect(temp_repo)
+    assert "JavaScript" in profile.languages
+    assert profile.detected_test_command == "node --check spaceman.js"
+
+def test_repo_inspector_package_json_fallback_scripts(temp_repo):
+    # package.json with build/lint script but no test script
+    with open(os.path.join(temp_repo, "package.json"), "w") as f:
+        f.write('{"name": "web-app", "scripts": {"build": "vite build", "lint": "eslint ."}}')
+    with open(os.path.join(temp_repo, "app.js"), "w") as f:
+        f.write("console.log('app');")
+
+    profile = RepoInspector.inspect(temp_repo)
+    assert profile.detected_test_command in ("npm run lint", "npm run build")
+
+def test_repo_inspector_resolve_verification_command_target_file(temp_repo):
+    # Test target-specific command resolution
+    with open(os.path.join(temp_repo, "helper.js"), "w") as f:
+        f.write("export function help() {}")
+    with open(os.path.join(temp_repo, "utils.py"), "w") as f:
+        f.write("def util(): pass")
+    with open(os.path.join(temp_repo, "index.html"), "w") as f:
+        f.write("<html><body></body></html>")
+
+    js_cmd = RepoInspector.resolve_verification_command(temp_repo, target_file="helper.js")
+    assert js_cmd == "node --check helper.js"
+
+    py_cmd = RepoInspector.resolve_verification_command(temp_repo, target_file="utils.py")
+    assert py_cmd == "python3 -m py_compile utils.py"
+
+    html_cmd = RepoInspector.resolve_verification_command(temp_repo, target_file="index.html")
+    assert html_cmd == "python3 -m html.parser index.html"
 
 def test_repo_inspector_excludes_ignored_directories_and_extensions(temp_repo):
     # Create ignored dirs
