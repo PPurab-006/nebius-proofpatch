@@ -1188,11 +1188,11 @@ ${
           {/* Logo Header */}
           <div className="p-4 border-b border-[#242820] flex items-center justify-between">
             {sidebarOpen ? (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 pl-0.5">
                 <img
                   src="/patchworks-horizontal.png"
                   alt="Patchworks"
-                  className="h-7 w-auto object-contain drop-shadow-[0_0_12px_rgba(183,255,60,0.18)]"
+                  className="h-9 w-auto object-contain drop-shadow-[0_0_14px_rgba(183,255,60,0.22)]"
                 />
               </div>
             ) : (
@@ -1200,7 +1200,7 @@ ${
                 <img
                   src="/patchworks-icon.png"
                   alt="Patchworks"
-                  className="w-7 h-7 object-contain drop-shadow-[0_0_8px_rgba(183,255,60,0.25)]"
+                  className="w-9 h-9 object-contain drop-shadow-[0_0_10px_rgba(183,255,60,0.28)]"
                 />
               </div>
             )}
