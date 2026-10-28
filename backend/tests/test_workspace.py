@@ -13,7 +13,7 @@ def workspace_manager():
 
 def test_create_and_cleanup_workspace(workspace_manager):
     with tempfile.TemporaryDirectory() as temp_repo:
-        os.system(f"cd {temp_repo} && git init && echo 'test' > test.txt && git add test.txt && git commit -m 'Initial'")
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'test' > test.txt && git add test.txt && git commit -m 'Initial'")
         
         ws_id = workspace_manager.create_workspace(f"file://{temp_repo}")
         assert ws_id is not None
@@ -26,7 +26,7 @@ def test_create_and_cleanup_workspace(workspace_manager):
 
 def test_run_tests_allowed_command(workspace_manager):
     with tempfile.TemporaryDirectory() as temp_repo:
-        os.system(f"cd {temp_repo} && git init && echo 'def test_pass():\n    assert True' > test_file.py && git add test_file.py && git commit -m 'Initial'")
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'def test_pass():\n    assert True' > test_file.py && git add test_file.py && git commit -m 'Initial'")
         ws_id = workspace_manager.create_workspace(f"file://{temp_repo}")
         
         result = workspace_manager.run_tests(ws_id, "pytest test_file.py")
@@ -35,7 +35,7 @@ def test_run_tests_allowed_command(workspace_manager):
 
 def test_run_tests_disallowed_command(workspace_manager):
      with tempfile.TemporaryDirectory() as temp_repo:
-        os.system(f"cd {temp_repo} && git init && echo 'test' > test.txt && git add test.txt && git commit -m 'Initial'")
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'test' > test.txt && git add test.txt && git commit -m 'Initial'")
         ws_id = workspace_manager.create_workspace(f"file://{temp_repo}")
         
         result = workspace_manager.run_tests(ws_id, "cat test.txt")
@@ -44,7 +44,7 @@ def test_run_tests_disallowed_command(workspace_manager):
 
 def test_run_tests_shell_injection(workspace_manager):
     with tempfile.TemporaryDirectory() as temp_repo:
-        os.system(f"cd {temp_repo} && git init && echo 'test' > test.txt && git add test.txt && git commit -m 'Initial'")
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'test' > test.txt && git add test.txt && git commit -m 'Initial'")
         ws_id = workspace_manager.create_workspace(f"file://{temp_repo}")
         
         result = workspace_manager.run_tests(ws_id, "pytest test.py; rm -rf /")

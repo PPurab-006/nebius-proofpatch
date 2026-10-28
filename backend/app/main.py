@@ -9,6 +9,7 @@ import tempfile
 import logging
 from typing import Optional, List, Dict, Any
 import re
+import subprocess
 from git import Repo
 from .workspace import WorkspaceManager, get_benchmark_fixtures_dir, resolve_benchmark_fixture_name
 from .patch_engine import PatchEngine
@@ -19,6 +20,13 @@ from .repo_inspector import RepoInspector, IGNORE_DIRS, IGNORE_EXTS
 from .auth import AuthUser, get_optional_user, get_current_user, supabase_manager
 from .crypto import token_encryptor, TokenEncryptionError
 from .reporting import compute_finding_fingerprint, format_commit_title
+
+# Ensure git author identity is set on headless container environments
+try:
+    subprocess.run(["git", "config", "--global", "user.email", "bot@proofpatch.test"], check=False)
+    subprocess.run(["git", "config", "--global", "user.name", "ProofPatch Bot"], check=False)
+except Exception:
+    pass
 
 logger = logging.getLogger(__name__)
 

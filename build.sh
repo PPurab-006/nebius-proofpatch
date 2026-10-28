@@ -4,6 +4,10 @@ set -o errexit
 
 echo "=== Patchworks Production Build ==="
 
+# Configure fallback git author identity for headless containers
+git config --global user.email "bot@proofpatch.test" || true
+git config --global user.name "ProofPatch Bot" || true
+
 # 1. Ensure Node.js & npm are available for frontend build
 if ! command -v node > /dev/null 2>&1 || ! command -v npm > /dev/null 2>&1; then
     echo "Node.js/npm not found in Python runtime. Bootstrapping portable Node.js LTS..."

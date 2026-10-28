@@ -53,15 +53,15 @@ def fix_hunk_headers(patch: str) -> str:
     lines = patch.splitlines()
     fixed_lines = []
     i = 0
-    hunk_header_re = re.compile(r"^@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@(.*)$")
+    hunk_header_re = re.compile(r"^@@(?:\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?)?.*@@(.*)$")
 
     while i < len(lines):
         line = lines[i]
         m = hunk_header_re.match(line)
         if m:
-            old_start = m.group(1)
-            new_start = m.group(2)
-            suffix = m.group(3)
+            old_start = m.group(1) or "1"
+            new_start = m.group(2) or "1"
+            suffix = m.group(3) or ""
 
             j = i + 1
             old_count = 0
@@ -92,6 +92,93 @@ def fix_hunk_headers(patch: str) -> str:
 
     return "\n".join(fixed_lines) + "\n"
 
+def resolve_target_file_in_workspace(workspace_path: str, raw_path: str, target_file_hint: Optional[str] = None) -> Optional[str]:
+    """Resolve a patch file path to an actual existing relative file path within workspace_path."""
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return None
+
+    clean = raw_path.replace("\\", "/").strip().lstrip("/")
+    if clean.startswith("b/") or clean.startswith("a/"):
+        clean = clean[2:]
+    clean = os.path.normpath(clean)
+
+    # 1. Direct path check
+    direct = os.path.join(workspace_path, clean)
+    if os.path.isfile(direct):
+        return clean
+
+    # 2. Check target_file_hint if provided
+    if target_file_hint:
+        hint_clean = target_file_hint.replace("\\", "/").strip().lstrip("/")
+        if hint_clean.startswith("b/") or hint_clean.startswith("a/"):
+            hint_clean = hint_clean[2:]
+        hint_clean = os.path.normpath(hint_clean)
+        if os.path.isfile(os.path.join(workspace_path, hint_clean)):
+            if not clean or os.path.basename(clean) == os.path.basename(hint_clean):
+                return hint_clean
+
+    # 3. Strip leading directory prefixes (e.g., repo name prefix 'nebius-proofpatch/backend/app/main.py')
+    parts = clean.split(os.sep)
+    for p_idx in range(1, len(parts)):
+        sub_rel = os.path.join(*parts[p_idx:])
+        if os.path.isfile(os.path.join(workspace_path, sub_rel)):
+            return sub_rel
+
+    # 4. Search by basename within workspace (excluding node_modules, .venv, etc.)
+    base_name = os.path.basename(clean)
+    if base_name:
+        candidates = []
+        for root, dirs, files in os.walk(workspace_path):
+            dirs[:] = [d for d in dirs if d not in [".git", "node_modules", ".venv", "__pycache__"]]
+            if base_name in files:
+                rel = os.path.relpath(os.path.join(root, base_name), workspace_path)
+                candidates.append(rel)
+        if len(candidates) == 1:
+            return candidates[0]
+        elif len(candidates) > 1 and target_file_hint:
+            for c in candidates:
+                if c.endswith(target_file_hint) or target_file_hint.endswith(c):
+                    return c
+
+    return None
+
+def normalize_patch_file_headers(workspace_path: str, patch: str, target_file_hint: Optional[str] = None) -> str:
+    """Normalize patch file headers (--- a/... and +++ b/...) to actual existing files in workspace."""
+    if not patch:
+        return patch
+
+    lines = patch.splitlines()
+    new_lines = []
+    path_a = None
+
+    for line in lines:
+        if line.startswith("--- "):
+            raw = line[4:].strip()
+            path_a = resolve_target_file_in_workspace(workspace_path, raw, target_file_hint)
+            if path_a:
+                new_lines.append(f"--- a/{path_a}")
+            else:
+                new_lines.append(line)
+        elif line.startswith("+++ "):
+            raw = line[4:].strip()
+            path_b = resolve_target_file_in_workspace(workspace_path, raw, target_file_hint)
+            if path_b:
+                new_lines.append(f"+++ b/{path_b}")
+            elif path_a:
+                new_lines.append(f"+++ b/{path_a}")
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    result = "\n".join(new_lines) + "\n"
+    if not ("--- " in result and "+++ " in result) and "@@" in result:
+        resolved_hint = resolve_target_file_in_workspace(workspace_path, target_file_hint or "", target_file_hint)
+        if resolved_hint:
+            result = f"--- a/{resolved_hint}\n+++ b/{resolved_hint}\n{result}"
+
+    return result
+
 def strip_leaked_json_artifacts(patch: str) -> str:
     """Strip leaked JSON delimiters like '"},' or '"} ' at the end of diff lines while preserving valid code."""
     if not patch:
@@ -114,14 +201,7 @@ class PatchEngine:
             return False
 
         sanitized_patch = strip_leaked_json_artifacts(fix_hunk_headers(normalize_diff_indentation(patch_content)))
-
-        # If headers are missing (e.g. LLM returned only hunk) and target_file_hint is provided, synthesize headers
-        if target_file_hint:
-            clean_hint = target_file_hint.replace("\\", "/").lstrip("/")
-            if clean_hint.startswith("b/") or clean_hint.startswith("a/"):
-                clean_hint = clean_hint[2:]
-            if not ("--- " in sanitized_patch and "+++ " in sanitized_patch) and "@@" in sanitized_patch:
-                sanitized_patch = f"--- a/{clean_hint}\n+++ b/{clean_hint}\n{sanitized_patch}"
+        sanitized_patch = normalize_patch_file_headers(workspace_path, sanitized_patch, target_file_hint=target_file_hint)
 
         patch_file_path = os.path.join(workspace_path, "repair.patch")
         try:
@@ -141,6 +221,11 @@ class PatchEngine:
                     # Also check --- a/<path>
                     raw_targets = re.findall(r'^[-]{3}\s+(?:a/)?(\S+)', sanitized_patch, re.MULTILINE)
                 target_files = raw_targets
+
+            if not target_files and target_file_hint:
+                resolved_hint = resolve_target_file_in_workspace(workspace_path, target_file_hint, target_file_hint)
+                if resolved_hint:
+                    target_files = [resolved_hint]
 
             if not target_files:
                 logger.warning("No target files identified in patch")
@@ -259,17 +344,15 @@ class PatchEngine:
             if not match_plus:
                 match_minus = re.search(r"^---\s+(?:a/)?(\S+)", section, re.MULTILINE)
                 if not match_minus:
-                    if target_file_hint:
-                        clean_hint = target_file_hint.replace("\\", "/").lstrip("/")
-                        if clean_hint.startswith("b/") or clean_hint.startswith("a/"):
-                            clean_hint = clean_hint[2:]
-                        target_rel = clean_hint
-                    else:
-                        continue
+                    raw_target = target_file_hint or ""
                 else:
-                    target_rel = match_minus.group(1)
+                    raw_target = match_minus.group(1)
             else:
-                target_rel = match_plus.group(1)
+                raw_target = match_plus.group(1)
+
+            target_rel = resolve_target_file_in_workspace(workspace_path, raw_target, target_file_hint=target_file_hint)
+            if not target_rel:
+                continue
 
             target_rel = os.path.normpath(target_rel)
             if target_rel.startswith("..") or target_rel.startswith("/") or target_rel.startswith("\\"):
@@ -288,7 +371,7 @@ class PatchEngine:
             except Exception:
                 continue
 
-            hunk_pattern = re.compile(r"^@@\s*-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s*@@.*$", re.MULTILINE)
+            hunk_pattern = re.compile(r"^@@(?:\s*-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?)?.*@@.*$", re.MULTILINE)
             hunk_splits = list(hunk_pattern.finditer(section))
             if not hunk_splits:
                 continue
@@ -388,29 +471,59 @@ class PatchEngine:
                             best_i = i
 
                     if best_ratio >= 0.65 and best_i != -1:
-                        match_start = target_indices[best_i]
-                        match_end = target_indices[min(len(target_indices) - 1, best_i + w_len - 1)]
-                        first_line = target_lines[match_start]
-                        base_indent = first_line[:len(first_line) - len(first_line.lstrip())]
-
                         plus_indents = [len(l) - len(l.lstrip()) for l in plus_raw if l.strip()]
                         min_indent = min(plus_indents) if plus_indents else 0
 
-                        new_lines = []
-                        for c in context_before:
-                            new_lines.append(f"{base_indent}{c}")
-                        for line in plus_raw:
-                            if not line.strip():
-                                new_lines.append("")
+                        if not minus_lines:
+                            # Subcase 2A: Pure addition between context_before and context_after
+                            # Preserves original lines in target_lines completely untouched
+                            if context_before:
+                                last_cb_idx = target_indices[best_i + len(context_before) - 1]
+                                insert_idx = last_cb_idx + 1
+                                ref_line = target_lines[last_cb_idx]
+                            elif context_after:
+                                first_ca_idx = target_indices[best_i]
+                                insert_idx = first_ca_idx
+                                ref_line = target_lines[first_ca_idx]
                             else:
-                                rel = line[:len(line) - len(line.lstrip())][min_indent:]
-                                new_lines.append(f"{base_indent}{rel}{line.lstrip()}")
-                        for c in context_after:
-                            new_lines.append(f"{base_indent}{c}")
+                                insert_idx = target_indices[best_i]
+                                ref_line = target_lines[insert_idx]
 
-                        new_target_lines = target_lines[:match_start] + new_lines + target_lines[match_end + 1:]
-                        file_content = "\n".join(new_target_lines)
-                        file_modified = True
+                            base_indent = ref_line[:len(ref_line) - len(ref_line.lstrip())]
+
+                            new_lines = []
+                            for line in plus_raw:
+                                if not line.strip():
+                                    new_lines.append("")
+                                else:
+                                    rel = line[:len(line) - len(line.lstrip())][min_indent:]
+                                    new_lines.append(f"{base_indent}{rel}{line.lstrip()}")
+
+                            new_target_lines = target_lines[:insert_idx] + new_lines + target_lines[insert_idx:]
+                            file_content = "\n".join(new_target_lines)
+                            file_modified = True
+                        else:
+                            # Subcase 2B: Fuzzy replacement of minus_lines
+                            # Replaces ONLY minus_lines slice; context_before and context_after remain untouched
+                            minus_start_stripped = best_i + len(context_before)
+                            minus_end_stripped = min(len(target_indices) - 1, best_i + len(context_before) + len(minus_lines) - 1)
+                            replace_start = target_indices[minus_start_stripped]
+                            replace_end = target_indices[minus_end_stripped]
+
+                            ref_line = target_lines[replace_start]
+                            base_indent = ref_line[:len(ref_line) - len(ref_line.lstrip())]
+
+                            new_lines = []
+                            for line in plus_raw:
+                                if not line.strip():
+                                    new_lines.append("")
+                                else:
+                                    rel = line[:len(line) - len(line.lstrip())][min_indent:]
+                                    new_lines.append(f"{base_indent}{rel}{line.lstrip()}")
+
+                            new_target_lines = target_lines[:replace_start] + new_lines + target_lines[replace_end + 1:]
+                            file_content = "\n".join(new_target_lines)
+                            file_modified = True
 
             if file_modified:
                 with open(abs_target, "w") as f:

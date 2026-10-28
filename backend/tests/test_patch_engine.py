@@ -5,7 +5,7 @@ from backend.app.patch_engine import PatchEngine
 
 def test_apply_valid_patch():
     with tempfile.TemporaryDirectory() as temp_repo:
-        os.system(f"cd {temp_repo} && git init && echo 'old line' > file.txt && git add file.txt && git commit -m 'Initial'")
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test' && echo 'old line' > file.txt && git add file.txt && git commit -m 'Initial'")
         
         patch_content = """--- a/file.txt
 +++ b/file.txt
@@ -168,6 +168,74 @@ def test_patch_engine_target_file_hint_without_diff_headers():
             content = f.read()
 
         assert "return a + b" in content
+
+def test_fuzzy_apply_patch_does_not_corrupt_surrounding_indentation():
+    """Verify that pure addition in nested blocks preserves original indentation of surrounding lines."""
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test'")
+
+        sample_code = """def exchange_oauth_code(code: str, redirect_uri: str = None):
+    payload = {
+        "client_id": "123",
+        "client_secret": "sec",
+        "code": code,
+    }
+    if redirect_uri:
+        payload["redirect_uri"] = redirect_uri
+    return payload
+"""
+        with open(os.path.join(temp_repo, "service.py"), "w") as f:
+            f.write(sample_code)
+
+        os.system(f"cd {temp_repo} && git add service.py && git commit -m 'Initial'")
+
+        # Patch adding a timeout field inside the payload dict
+        patch = """--- a/service.py
++++ b/service.py
+@@ -3,3 +3,4 @@
+         "client_id": "123",
+         "client_secret": "sec",
+         "code": code,
++        "timeout": 15,
+     }
+     if redirect_uri:
+"""
+        success = PatchEngine.apply_patch(temp_repo, patch)
+        assert success is True
+
+        with open(os.path.join(temp_repo, "service.py"), "r") as f:
+            content = f.read()
+
+        # Must compile without IndentationError or SyntaxError
+        compile(content, "service.py", "exec")
+        assert 'if redirect_uri:' in content
+        assert '    if redirect_uri:' in content
+        assert '"timeout": 15,' in content
+
+def test_patch_engine_normalizes_repo_name_prefix():
+    """Verify that patches with repository folder prefixes in headers are resolved to the workspace root."""
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test'")
+
+        sample_code = "VAL = 1\n"
+        with open(os.path.join(temp_repo, "config.py"), "w") as f:
+            f.write(sample_code)
+
+        os.system(f"cd {temp_repo} && git add config.py && git commit -m 'Initial'")
+
+        patch = """--- a/my-repo-name/config.py
++++ b/my-repo-name/config.py
+@@ -1,1 +1,1 @@
+-VAL = 1
++VAL = 2
+"""
+        success = PatchEngine.apply_patch(temp_repo, patch)
+        assert success is True
+
+        with open(os.path.join(temp_repo, "config.py"), "r") as f:
+            content = f.read()
+
+        assert "VAL = 2" in content
 
 
 
