@@ -1,10 +1,28 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { supabase, isSupabaseConfigured } from './supabaseClient';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 if (API_BASE_URL) {
   axios.defaults.baseURL = API_BASE_URL;
 }
+
+// Attach Supabase access token to all outgoing requests if active
+axios.interceptors.request.use(async (config) => {
+  if (supabase) {
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.access_token) {
+        config.headers = config.headers || {};
+        config.headers.Authorization = `Bearer ${session.access_token}`;
+      }
+    } catch (err) {
+      console.error('Error attaching auth token to request:', err);
+    }
+  }
+  return config;
+});
+
 import {
   Bug,
   CheckCircle2,
@@ -35,7 +53,11 @@ import {
   ExternalLink,
   Lock,
   Search,
-  Key
+  Key,
+  User,
+  LogIn,
+  LogOut,
+  Mail
 } from 'lucide-react';
 
 const Github = ({ className = "w-4 h-4" }: { className?: string }) => (
@@ -57,6 +79,7 @@ interface HealthStatus {
   status: string;
   message: string;
   nebius_configured: boolean;
+  supabase_configured?: boolean;
   model: string;
 }
 
@@ -259,6 +282,16 @@ export default function App() {
   const [loadingMessage, setLoadingMessage] = useState('');
   const [error, setError] = useState('');
 
+  // Supabase User Authentication States
+  const [user, setUser] = useState<{ id: string; email?: string; avatar_url?: string } | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authMode, setAuthMode] = useState<'signin' | 'signup' | 'magic'>('signin');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [authSuccessMsg, setAuthSuccessMsg] = useState('');
+
   // Session history
   const [recentSessions, setRecentSessions] = useState<SessionRecord[]>(() => {
     try {
@@ -269,6 +302,135 @@ export default function App() {
     }
   });
 
+  const fetchPersistentHistory = async () => {
+    try {
+      const res = await axios.get('/api/history');
+      if (res.data?.sessions && Array.isArray(res.data.sessions)) {
+        const mapped: SessionRecord[] = res.data.sessions.map((row: any) => ({
+          id: row.id,
+          workspaceId: row.workspace_id || row.id,
+          timestamp: row.created_at ? new Date(row.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Recent',
+          repoUrl: row.repo_url,
+          issueDescription: row.issue_description,
+          verificationStatus: row.verification_status || 'DIAGNOSED',
+          diagnosis: row.diagnosis,
+          repair: row.patch
+            ? {
+                status: row.status || 'success',
+                patch: row.patch,
+                verification_status: row.verification_status || 'VERIFIED',
+                verification_details: row.verification_details,
+              }
+            : undefined,
+          prUrl: row.pr_url,
+          prNumber: row.pr_number,
+          branch: row.branch,
+        }));
+        setRecentSessions(mapped);
+      }
+    } catch (e) {
+      console.error('Failed to fetch persistent history:', e);
+    }
+  };
+
+  const handleSupabaseGitHubLogin = async () => {
+    if (!supabase) return;
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'github',
+        options: {
+          redirectTo: window.location.origin,
+        },
+      });
+      if (error) throw error;
+    } catch (err: any) {
+      setAuthError(err.message || 'GitHub OAuth initiation failed');
+      setAuthLoading(false);
+    }
+  };
+
+  const handleEmailSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!supabase) return;
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+      if (error) throw error;
+      setAuthModalOpen(false);
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to sign in');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleEmailSignUp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!supabase) return;
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+      if (error) throw error;
+      if (data.session) {
+        setAuthModalOpen(false);
+      } else {
+        setAuthSuccessMsg('Sign-up confirmation sent! Please check your inbox.');
+      }
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to sign up');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleMagicLink = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!supabase) return;
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      const { error } = await supabase.auth.signInWithOtp({
+        email: authEmail.trim(),
+        options: {
+          emailRedirectTo: window.location.origin,
+        },
+      });
+      if (error) throw error;
+      setAuthSuccessMsg('Magic link sent to your email!');
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to send magic link');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    if (!supabase) return;
+    try {
+      await supabase.auth.signOut();
+      setUser(null);
+      try {
+        const saved = localStorage.getItem('patchworks_sessions');
+        setRecentSessions(saved ? JSON.parse(saved) : []);
+      } catch {
+        setRecentSessions([]);
+      }
+      fetchGitHubStatus();
+    } catch (err) {
+      console.error('Error signing out:', err);
+    }
+  };
+
   useEffect(() => {
     fetchHealth();
     fetchGitHubStatus();
@@ -277,6 +439,44 @@ export default function App() {
     if (params.get('github_connected') === 'true') {
       window.history.replaceState({}, '', window.location.pathname);
       fetchGitHubStatus();
+    }
+
+    if (supabase) {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session?.user) {
+          setUser({
+            id: session.user.id,
+            email: session.user.email,
+            avatar_url: session.user.user_metadata?.avatar_url,
+          });
+          fetchPersistentHistory();
+        }
+      });
+
+      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+        if (session?.user) {
+          setUser({
+            id: session.user.id,
+            email: session.user.email,
+            avatar_url: session.user.user_metadata?.avatar_url,
+          });
+          fetchGitHubStatus();
+          fetchPersistentHistory();
+        } else {
+          setUser(null);
+          fetchGitHubStatus();
+          try {
+            const saved = localStorage.getItem('patchworks_sessions');
+            setRecentSessions(saved ? JSON.parse(saved) : []);
+          } catch {
+            setRecentSessions([]);
+          }
+        }
+      });
+
+      return () => {
+        subscription.unsubscribe();
+      };
     }
   }, []);
 
@@ -473,6 +673,57 @@ export default function App() {
       }
       return updated;
     });
+
+    if (user) {
+      axios.post('/api/history', {
+        workspace_id: wsId,
+        repo_url: record.repoUrl,
+        issue_description: issueDescription || 'Investigation session',
+        mode: requestMode,
+        status: 'completed',
+        diagnosis: diag as any,
+        findings: diagnosis?.findings as any,
+        patch: rep?.patch,
+        verification_status: record.verificationStatus,
+        verification_details: rep?.verification_details as any,
+        pr_url: record.prUrl,
+        pr_number: record.prNumber,
+        branch: record.branch,
+      }).catch((e) => console.warn('Could not persist session to backend history:', e));
+    }
+  };
+
+  const deleteSession = async (sessionId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRecentSessions((prev) => {
+      const updated = prev.filter((s) => s.id !== sessionId && s.workspaceId !== sessionId);
+      try {
+        localStorage.setItem('patchworks_sessions', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+    if (user) {
+      try {
+        await axios.delete(`/api/history/${sessionId}`);
+      } catch (err) {
+        console.warn('Failed to delete session from server:', err);
+      }
+    }
+  };
+
+  const clearSessions = async () => {
+    const toDelete = [...recentSessions];
+    setRecentSessions([]);
+    try {
+      localStorage.removeItem('patchworks_sessions');
+    } catch {}
+    if (user) {
+      for (const s of toDelete) {
+        try {
+          await axios.delete(`/api/history/${s.id}`);
+        } catch {}
+      }
+    }
   };
 
   const loadBenchmark = async (type: 'simple_bug' | 'edge_case') => {
@@ -547,13 +798,22 @@ export default function App() {
 
   const handleDiagnose = async () => {
     setLoading(true);
-    setLoadingMessage(
-      requestMode === 'improvement'
-        ? 'Auditing repository and generating improvement recommendations...'
-        : requestMode === 'bug_discovery'
-        ? 'Scanning repository for latent bugs and correctness defects...'
-        : 'Synthesizing defect diagnosis with Nebius inference engine...'
-    );
+    let initialLoadingMsg = 'Synthesizing defect diagnosis with Nebius inference engine...';
+    if (requestMode === 'improvement') {
+      initialLoadingMsg = 'Auditing repository and generating improvement recommendations...';
+    } else if (requestMode === 'bug_discovery') {
+      initialLoadingMsg = 'Scanning repository for latent bugs and correctness defects...';
+    } else {
+      const lower = (issueDescription || '').toLowerCase();
+      if (lower.includes('improv') || lower.includes('enhanc') || lower.includes('better') || lower.includes('review') || lower.includes('audit')) {
+        initialLoadingMsg = 'Auditing repository and generating improvement recommendations with Nebius...';
+      } else if (lower.includes('scan') || lower.includes('find') || lower.includes('latent') || lower.includes('vulnerab') || lower.includes('security')) {
+        initialLoadingMsg = 'Scanning repository for latent defects with Nebius inference engine...';
+      } else {
+        initialLoadingMsg = 'Investigating repository and synthesizing findings with Nebius...';
+      }
+    }
+    setLoadingMessage(initialLoadingMsg);
     setPipelineStep(2);
     setError('');
     try {
@@ -1009,11 +1269,9 @@ ${
                 </span>
                 {recentSessions.length > 0 && (
                   <button
-                    onClick={() => {
-                      setRecentSessions([]);
-                      localStorage.removeItem('patchworks_sessions');
-                    }}
+                    onClick={clearSessions}
                     className="text-[10px] text-[#969B90] hover:text-[#FF5C68] transition-colors"
+                    title={user ? "Clear sessions from database and view" : "Clear local sessions"}
                   >
                     Clear
                   </button>
@@ -1032,11 +1290,20 @@ ${
                         if (s.diagnosis) setDiagnosis({ status: 'success', workspace_id: s.workspaceId, diagnosis: s.diagnosis });
                         if (s.repair) setRepair(s.repair);
                       }}
-                      className="p-2 rounded bg-[#11140F] border border-[#242820] hover:border-[#B7FF3C]/40 cursor-pointer transition-colors"
+                      className="p-2 rounded bg-[#11140F] border border-[#242820] hover:border-[#B7FF3C]/40 cursor-pointer transition-colors group"
                     >
                       <div className="flex items-center justify-between mb-1">
                         <span className="font-mono text-[10px] text-[#B7FF3C]">{s.workspaceId.slice(0, 8)}</span>
-                        <span className="text-[9px] text-[#969B90]">{s.timestamp}</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[9px] text-[#969B90]">{s.timestamp}</span>
+                          <button
+                            onClick={(e) => deleteSession(s.id, e)}
+                            className="text-[#969B90] hover:text-[#FF5C68] p-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                            title="Delete session"
+                          >
+                            <X className="w-2.5 h-2.5" />
+                          </button>
+                        </div>
                       </div>
                       <p className="text-[11px] text-[#F4F5F0] truncate">{s.issueDescription}</p>
                       <div className="mt-1 flex items-center justify-between">
@@ -1137,6 +1404,42 @@ ${
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Supabase User Account Section */}
+            {isSupabaseConfigured && (
+              user ? (
+                <div className="flex items-center gap-2 bg-[#11140F] border border-[#242820] hover:border-[#B7FF3C]/50 px-2.5 py-1 rounded text-xs font-mono transition-colors">
+                  {user.avatar_url ? (
+                    <img
+                      src={user.avatar_url}
+                      alt=""
+                      className="w-4 h-4 rounded-full border border-[#242820]"
+                    />
+                  ) : (
+                    <User className="w-3.5 h-3.5 text-[#B7FF3C]" />
+                  )}
+                  <span className="text-[#F4F5F0] max-w-[120px] truncate" title={user.email || 'Authenticated User'}>
+                    {user.email ? user.email.split('@')[0] : 'User'}
+                  </span>
+                  <button
+                    onClick={handleSignOut}
+                    className="text-[#969B90] hover:text-[#FF5C68] ml-1 p-0.5 rounded transition-colors"
+                    title="Sign Out"
+                  >
+                    <LogOut className="w-3 h-3" />
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setAuthModalOpen(true)}
+                  className="flex items-center gap-1.5 bg-[#11140F] hover:bg-[#191D16] border border-[#242820] hover:border-[#B7FF3C] text-xs font-mono text-[#F4F5F0] hover:text-[#B7FF3C] px-3 py-1 rounded transition-colors"
+                  title="Sign in with your Patchworks account to persist connections and history"
+                >
+                  <LogIn className="w-3.5 h-3.5 text-[#B7FF3C]" />
+                  <span>Sign In</span>
+                </button>
+              )
+            )}
+
             {/* GitHub Account Badge / Button */}
             {ghStatus.connected && ghStatus.user ? (
               <div className="flex items-center gap-2 bg-[#11140F] border border-[#242820] hover:border-[#B7FF3C]/50 px-2.5 py-1 rounded text-xs font-mono transition-colors">
@@ -2463,7 +2766,7 @@ NEBIUS_MODEL_NAME="nvidia/Nemotron-3_5-Lightning"`}
 
               <div className="p-2.5 bg-[#050505] rounded border border-[#242820] text-[10px] text-[#969B90] leading-relaxed space-y-1">
                 <span className="text-[#B7FF3C] font-semibold block">Security Guarantee:</span>
-                Tokens are validated securely on the backend, retained exclusively in session memory, never exposed in client logs or URLs, and never written into git remote configurations.
+                Tokens are validated securely on the backend, encrypted at rest, never exposed in client logs or URLs, and never stored in frontend storage.
               </div>
             </div>
 
@@ -2493,6 +2796,153 @@ NEBIUS_MODEL_NAME="nvidia/Nemotron-3_5-Lightning"`}
                 )}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Supabase User Authentication Modal */}
+      {authModalOpen && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+          <div className="bg-[#0B0D0A] border border-[#242820] p-6 rounded-lg max-w-md w-full space-y-4 glow-lime-sm">
+            <div className="flex items-center justify-between border-b border-[#242820] pb-3">
+              <div className="flex items-center gap-2 text-[#F4F5F0]">
+                <User className="w-5 h-5 text-[#B7FF3C]" />
+                <h4 className="text-sm font-mono uppercase font-bold">
+                  {authMode === 'signup'
+                    ? 'Create Patchworks Account'
+                    : authMode === 'magic'
+                    ? 'Sign In via Magic Link'
+                    : 'Sign In to Patchworks'}
+                </h4>
+              </div>
+              <button
+                onClick={() => {
+                  setAuthModalOpen(false);
+                  setAuthError('');
+                  setAuthSuccessMsg('');
+                }}
+                disabled={authLoading}
+                className="text-[#969B90] hover:text-[#F4F5F0]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {authError && (
+              <div className="p-2.5 bg-[#FF5C68]/10 border border-[#FF5C68]/30 rounded text-xs font-mono text-[#FF5C68]">
+                {authError}
+              </div>
+            )}
+
+            {authSuccessMsg && (
+              <div className="p-2.5 bg-[#B7FF3C]/10 border border-[#B7FF3C]/30 rounded text-xs font-mono text-[#B7FF3C]">
+                {authSuccessMsg}
+              </div>
+            )}
+
+            {/* GitHub OAuth Button */}
+            <div className="space-y-3 pb-2">
+              <button
+                type="button"
+                onClick={handleSupabaseGitHubLogin}
+                disabled={authLoading}
+                className="w-full py-2.5 px-3 rounded bg-[#1A1F14] hover:bg-[#252C1C] border border-[#B7FF3C]/50 text-[#F4F5F0] text-xs font-mono font-bold flex items-center justify-center gap-2 transition-all hover:border-[#B7FF3C] disabled:opacity-50"
+              >
+                <Github className="w-4 h-4 text-[#B7FF3C]" />
+                <span>Continue with GitHub</span>
+              </button>
+              <div className="relative flex items-center py-1">
+                <div className="flex-grow border-t border-[#242820]"></div>
+                <span className="flex-shrink mx-2 text-[10px] text-[#969B90] uppercase font-mono">or email</span>
+                <div className="flex-grow border-t border-[#242820]"></div>
+              </div>
+            </div>
+
+            {/* Mode Tabs */}
+            <div className="flex border-b border-[#242820] gap-4 text-xs font-mono">
+              <button
+                type="button"
+                onClick={() => { setAuthMode('signin'); setAuthError(''); setAuthSuccessMsg(''); }}
+                className={`pb-1.5 transition-colors ${authMode === 'signin' ? 'text-[#B7FF3C] border-b-2 border-[#B7FF3C]' : 'text-[#969B90] hover:text-[#F4F5F0]'}`}
+              >
+                Sign In
+              </button>
+              <button
+                type="button"
+                onClick={() => { setAuthMode('signup'); setAuthError(''); setAuthSuccessMsg(''); }}
+                className={`pb-1.5 transition-colors ${authMode === 'signup' ? 'text-[#B7FF3C] border-b-2 border-[#B7FF3C]' : 'text-[#969B90] hover:text-[#F4F5F0]'}`}
+              >
+                Sign Up
+              </button>
+              <button
+                type="button"
+                onClick={() => { setAuthMode('magic'); setAuthError(''); setAuthSuccessMsg(''); }}
+                className={`pb-1.5 transition-colors flex items-center gap-1 ${authMode === 'magic' ? 'text-[#B7FF3C] border-b-2 border-[#B7FF3C]' : 'text-[#969B90] hover:text-[#F4F5F0]'}`}
+              >
+                <Mail className="w-3 h-3" />
+                <span>Magic Link</span>
+              </button>
+            </div>
+
+            {/* Email form */}
+            <form onSubmit={authMode === 'signup' ? handleEmailSignUp : authMode === 'magic' ? handleMagicLink : handleEmailSignIn} className="space-y-3 text-xs font-mono">
+              <div>
+                <label className="block text-[11px] font-mono uppercase text-[#969B90] mb-1">Email Address</label>
+                <input
+                  type="email"
+                  required
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  disabled={authLoading}
+                  placeholder="developer@example.com"
+                  className="w-full bg-[#11140F] border border-[#242820] rounded p-2 text-xs text-[#F4F5F0] font-mono focus:border-[#B7FF3C] outline-none"
+                />
+              </div>
+
+              {authMode !== 'magic' && (
+                <div>
+                  <label className="block text-[11px] font-mono uppercase text-[#969B90] mb-1">Password</label>
+                  <input
+                    type="password"
+                    required
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    disabled={authLoading}
+                    placeholder="••••••••••••"
+                    className="w-full bg-[#11140F] border border-[#242820] rounded p-2 text-xs text-[#F4F5F0] font-mono focus:border-[#B7FF3C] outline-none"
+                  />
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setAuthModalOpen(false)}
+                  disabled={authLoading}
+                  className="px-3 py-1.5 rounded bg-[#11140F] border border-[#242820] text-xs font-mono text-[#969B90] hover:text-[#F4F5F0]"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={authLoading || !authEmail.trim()}
+                  className="px-4 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] text-[#050505] text-xs font-mono font-bold transition-all glow-lime flex items-center gap-1.5 disabled:opacity-50"
+                >
+                  {authLoading ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Processing...</span>
+                    </>
+                  ) : authMode === 'signup' ? (
+                    <span>Create Account</span>
+                  ) : authMode === 'magic' ? (
+                    <span>Send Magic Link</span>
+                  ) : (
+                    <span>Sign In</span>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

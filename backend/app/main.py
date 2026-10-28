@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
+from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse
@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import os
 import shutil
 import tempfile
+import logging
 from typing import Optional, List, Dict, Any
 import re
 from .workspace import WorkspaceManager, get_benchmark_fixtures_dir, resolve_benchmark_fixture_name
@@ -14,6 +15,10 @@ from .nebius_client import NebiusClient, NebiusInferenceError
 from .github_service import GitHubService, REPO_NAME_REGEX, sanitize_branch_name
 from .intent_classifier import classify_intent, RequestIntent
 from .repo_inspector import RepoInspector, IGNORE_DIRS, IGNORE_EXTS
+from .auth import AuthUser, get_optional_user, get_current_user, supabase_manager
+from .crypto import token_encryptor, TokenEncryptionError
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Patchworks API", version="0.1.0")
 
@@ -31,6 +36,38 @@ app.add_middleware(
 workspace_manager = WorkspaceManager()
 nebius_client = NebiusClient()
 github_service = GitHubService()
+
+def resolve_github_token(user: Optional[AuthUser] = None, explicit_token: Optional[str] = None) -> Optional[str]:
+    """Resolve GitHub token with precedence: explicit request token > authenticated user's encrypted token > guest fallback."""
+    if explicit_token and explicit_token.strip():
+        return explicit_token.strip()
+
+    if user:
+        if supabase_manager.is_configured:
+            conn = supabase_manager.get_github_connection(user.id)
+            if conn and conn.get("encrypted_access_token"):
+                try:
+                    decrypted = token_encryptor.decrypt(conn["encrypted_access_token"])
+                    return decrypted.strip()
+                except TokenEncryptionError as e:
+                    logger.error(f"Failed to decrypt stored token for user {user.id}: {e}")
+                    return None
+        # Authenticated users MUST NOT inherit another user's in-memory session token
+        return None
+
+    # Anonymous guest mode fallback
+    return github_service.get_token()
+
+def verify_workspace_access(workspace_id: str, user: Optional[AuthUser] = None):
+    """Enforce workspace ownership to prevent cross-user workspace tampering."""
+    meta = workspace_manager.get_workspace_metadata(workspace_id)
+    owner_id = meta.get("user_id") if meta else None
+    if owner_id:
+        if not user or user.id != owner_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied: workspace belongs to another user"
+            )
 
 class BenchmarkWorkspaceRequest(BaseModel):
     fixture: str
@@ -144,11 +181,12 @@ async def health_check():
         "status": "ok", 
         "message": "Patchworks Backend is running",
         "nebius_configured": not nebius_client.mock_mode,
+        "supabase_configured": supabase_manager.is_configured,
         "model": nebius_client.model_name
     }
 
 @app.post("/api/upload")
-def upload_zip(file: UploadFile = File(...)):
+def upload_zip(file: UploadFile = File(...), user: Optional[AuthUser] = Depends(get_optional_user)):
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="Only .zip files are allowed")
 
@@ -157,6 +195,8 @@ def upload_zip(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, temp_zip)
         temp_zip.close()
         ws_id = workspace_manager.create_workspace_from_zip(temp_zip.name)
+        if user:
+            workspace_manager.update_workspace_metadata(ws_id, {"user_id": user.id})
         return {"status": "success", "workspace_id": ws_id}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -165,9 +205,11 @@ def upload_zip(file: UploadFile = File(...)):
             os.remove(temp_zip.name)
 
 @app.post("/api/benchmark/workspace")
-def create_benchmark_workspace(request: BenchmarkWorkspaceRequest):
+def create_benchmark_workspace(request: BenchmarkWorkspaceRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
     try:
         ws_id = workspace_manager.create_workspace_from_benchmark(request.fixture)
+        if user:
+            workspace_manager.update_workspace_metadata(ws_id, {"user_id": user.id})
         metadata = workspace_manager.get_workspace_metadata(ws_id)
         return {
             "status": "success",
@@ -190,7 +232,7 @@ def list_benchmarks():
     return {"status": "success", "benchmarks": benchmarks}
 
 @app.post("/api/inspect")
-def inspect_repository(request: InspectRequest):
+def inspect_repository(request: InspectRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
     ws_id = request.workspace_id
     is_new_workspace = False
 
@@ -208,6 +250,10 @@ def inspect_repository(request: InspectRequest):
                 is_new_workspace = True
             else:
                 raise HTTPException(status_code=400, detail="Either workspace_id, benchmark, or repo_url must be provided")
+            if user:
+                workspace_manager.update_workspace_metadata(ws_id, {"user_id": user.id})
+        else:
+            verify_workspace_access(ws_id, user)
 
         ws_path = workspace_manager.get_workspace_path(ws_id)
         profile = RepoInspector.inspect(ws_path)
@@ -223,13 +269,17 @@ def inspect_repository(request: InspectRequest):
             "profile": profile.to_dict(),
             "test_result": test_result
         }
+    except HTTPException:
+        if is_new_workspace and ws_id:
+            workspace_manager.cleanup_workspace(ws_id)
+        raise
     except Exception as e:
         if is_new_workspace and ws_id:
             workspace_manager.cleanup_workspace(ws_id)
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/diagnose")
-def diagnose(request: DiagnosisRequest):
+def diagnose(request: DiagnosisRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
     ws_id = request.workspace_id
     is_new_workspace = False
 
@@ -247,6 +297,10 @@ def diagnose(request: DiagnosisRequest):
                 is_new_workspace = True
             else:
                 raise HTTPException(status_code=400, detail="Either workspace_id, benchmark, or repo_url must be provided")
+            if user:
+                workspace_manager.update_workspace_metadata(ws_id, {"user_id": user.id})
+        else:
+            verify_workspace_access(ws_id, user)
 
         ws_path = workspace_manager.get_workspace_path(ws_id)
         profile = RepoInspector.inspect(ws_path)
@@ -262,7 +316,7 @@ def diagnose(request: DiagnosisRequest):
 
         if mode in ("bug_discovery", "improvement"):
             # Open-ended repository investigation
-            bounded_context = RepoInspector.build_bounded_context(ws_path, max_total_chars=18000)
+            bounded_context = RepoInspector.build_bounded_context(ws_path, profile=profile.to_dict(), max_total_chars=14000)
             try:
                 investigation = nebius_client.investigate(
                     intent=mode,
@@ -271,7 +325,8 @@ def diagnose(request: DiagnosisRequest):
                     code_context=bounded_context
                 )
             except NebiusInferenceError as e:
-                raise HTTPException(status_code=502, detail=str(e))
+                status_code = 504 if "timed out" in str(e).lower() else 502
+                raise HTTPException(status_code=status_code, detail=str(e))
 
             findings = investigation.get("findings", [])
             primary_finding = findings[0] if findings else {}
@@ -292,9 +347,25 @@ def diagnose(request: DiagnosisRequest):
                     "investigation": investigation,
                     "findings": findings,
                     "diagnosis": diagnosis_summary,
-                    "test_command": test_cmd
+                    "test_command": test_cmd,
+                    "user_id": user.id if user else None
                 }
             )
+
+            # Persist to Supabase if authenticated user is active
+            if user and supabase_manager.is_configured:
+                supabase_manager.save_repair_session(
+                    user_id=user.id,
+                    session_data={
+                        "workspace_id": ws_id,
+                        "repo_url": request.repo_url or ws_path,
+                        "issue_description": request.issue_description,
+                        "mode": mode,
+                        "status": "diagnosed",
+                        "diagnosis": diagnosis_summary,
+                        "findings": findings
+                    }
+                )
 
             return {
                 "status": "success",
@@ -312,7 +383,8 @@ def diagnose(request: DiagnosisRequest):
             try:
                 diagnosis = nebius_client.diagnose(request.issue_description, code_context)
             except NebiusInferenceError as e:
-                raise HTTPException(status_code=502, detail=str(e))
+                status_code = 504 if "timed out" in str(e).lower() else 502
+                raise HTTPException(status_code=status_code, detail=str(e))
 
             workspace_manager.update_workspace_metadata(
                 ws_id,
@@ -321,9 +393,25 @@ def diagnose(request: DiagnosisRequest):
                     "mode": "targeted",
                     "profile": profile.to_dict(),
                     "diagnosis": diagnosis,
-                    "test_command": test_cmd
+                    "test_command": test_cmd,
+                    "user_id": user.id if user else None
                 }
             )
+
+            # Persist to Supabase if authenticated user is active
+            if user and supabase_manager.is_configured:
+                supabase_manager.save_repair_session(
+                    user_id=user.id,
+                    session_data={
+                        "workspace_id": ws_id,
+                        "repo_url": request.repo_url or ws_path,
+                        "issue_description": request.issue_description,
+                        "mode": "targeted",
+                        "status": "diagnosed",
+                        "diagnosis": diagnosis,
+                        "findings": []
+                    }
+                )
 
             return {
                 "status": "success",
@@ -344,7 +432,7 @@ def diagnose(request: DiagnosisRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/repair")
-def propose_repair(request: RepairRequest):
+def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
     ws_id = request.workspace_id
     is_new_workspace = False
 
@@ -362,6 +450,10 @@ def propose_repair(request: RepairRequest):
                 is_new_workspace = True
             else:
                 raise HTTPException(status_code=400, detail="Either workspace_id, benchmark, or repo_url must be provided")
+            if user:
+                workspace_manager.update_workspace_metadata(ws_id, {"user_id": user.id})
+        else:
+            verify_workspace_access(ws_id, user)
 
         ws_path = workspace_manager.get_workspace_path(ws_id)
 
@@ -472,9 +564,28 @@ def propose_repair(request: RepairRequest):
                 "patch": patch,
                 "patch_applied": True,
                 "verification_status": verification_result,
-                "verification_details": test_details
+                "verification_details": test_details,
+                "user_id": user.id if user else None
             }
         )
+
+        if user and supabase_manager.is_configured:
+            meta = workspace_manager.get_workspace_metadata(ws_id) or {}
+            supabase_manager.save_repair_session(
+                user_id=user.id,
+                session_data={
+                    "workspace_id": ws_id,
+                    "repo_url": meta.get("clone_url") or meta.get("repo_url") or request.repo_url or "",
+                    "issue_description": request.issue_description or meta.get("issue_description", ""),
+                    "mode": meta.get("mode", "targeted"),
+                    "status": "verified" if (verification_result == "FIX VERIFIED") else "repaired",
+                    "diagnosis": meta.get("diagnosis", meta.get("diagnosis_context", {})),
+                    "findings": meta.get("findings", []),
+                    "patch": patch,
+                    "verification_status": verification_result,
+                    "verification_details": test_details or {}
+                }
+            )
 
         return {
             "status": "success",
@@ -484,13 +595,18 @@ def propose_repair(request: RepairRequest):
             "verification_status": verification_result,
             "verification_details": test_details
         }
+    except HTTPException:
+        if is_new_workspace and ws_id:
+            workspace_manager.cleanup_workspace(ws_id)
+        raise
     except Exception as e:
         if is_new_workspace and ws_id:
             workspace_manager.cleanup_workspace(ws_id)
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/rollback")
-def rollback(request: RollbackRequest):
+def rollback(request: RollbackRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
+    verify_workspace_access(request.workspace_id, user)
     success = workspace_manager.rollback_patch(request.workspace_id)
     if success:
         return {"status": "success", "message": "Rollback successful"}
@@ -498,7 +614,8 @@ def rollback(request: RollbackRequest):
         raise HTTPException(status_code=400, detail="Rollback failed")
 
 @app.delete("/api/workspace/{workspace_id}")
-def cleanup(workspace_id: str):
+def cleanup(workspace_id: str, user: Optional[AuthUser] = Depends(get_optional_user)):
+    verify_workspace_access(workspace_id, user)
     workspace_manager.cleanup_workspace(workspace_id)
     return {"status": "success"}
 
@@ -506,17 +623,88 @@ def cleanup(workspace_id: str):
 # GitHub Integration Endpoints
 # ---------------------------------------------------------
 
+class SaveSessionRequest(BaseModel):
+    workspace_id: Optional[str] = None
+    repo_url: str
+    issue_description: str
+    mode: Optional[str] = "targeted"
+    status: Optional[str] = "completed"
+    diagnosis: Optional[Dict[str, Any]] = None
+    findings: Optional[List[Dict[str, Any]]] = None
+    patch: Optional[str] = None
+    verification_status: Optional[str] = None
+    verification_details: Optional[Dict[str, Any]] = None
+    pr_url: Optional[str] = None
+    pr_number: Optional[int] = None
+    branch: Optional[str] = None
+
 @app.get("/api/github/status")
-def github_status():
-    token = github_service.get_token()
+def github_status(user: Optional[AuthUser] = Depends(get_optional_user)):
     oauth_available = github_service.is_oauth_configured()
+    
+    # 1. Authenticated user path (user-scoped from Supabase)
+    if user and supabase_manager.is_configured:
+        conn = supabase_manager.get_github_connection(user.id)
+        if not conn:
+            return {
+                "connected": False,
+                "configured": github_service.is_configured(),
+                "oauth_available": oauth_available,
+                "user": None,
+                "auth_type": "none",
+                "account": {"id": user.id, "email": user.email}
+            }
+        
+        # Verify active token validity with GitHub API
+        try:
+            token = token_encryptor.decrypt(conn["encrypted_access_token"])
+            user_info = github_service.verify_token(token)
+            if user_info.get("valid"):
+                return {
+                    "connected": True,
+                    "configured": True,
+                    "oauth_available": oauth_available,
+                    "user": {
+                        "login": user_info.get("login") or conn.get("github_login"),
+                        "name": user_info.get("name") or conn.get("github_login"),
+                        "avatar_url": user_info.get("avatar_url") or conn.get("avatar_url"),
+                        "html_url": user_info.get("html_url") or conn.get("html_url"),
+                        "scopes": user_info.get("scopes", conn.get("scopes", []))
+                    },
+                    "auth_type": conn.get("auth_type", "oauth"),
+                    "account": {"id": user.id, "email": user.email}
+                }
+            else:
+                return {
+                    "connected": False,
+                    "configured": True,
+                    "oauth_available": oauth_available,
+                    "user": None,
+                    "auth_type": "expired",
+                    "error": user_info.get("error", "GitHub token has expired or was revoked. Please reconnect."),
+                    "account": {"id": user.id, "email": user.email}
+                }
+        except TokenEncryptionError:
+            return {
+                "connected": False,
+                "configured": True,
+                "oauth_available": oauth_available,
+                "user": None,
+                "auth_type": "invalid",
+                "error": "Encryption key changed or token corrupted. Please reconnect.",
+                "account": {"id": user.id, "email": user.email}
+            }
+
+    # 2. Guest / Demo / Test Fallback
+    token = github_service.get_token()
     if not token:
         return {
             "connected": False,
             "configured": github_service.is_configured(),
             "oauth_available": oauth_available,
             "user": None,
-            "auth_type": "none"
+            "auth_type": "none",
+            "account": None
         }
     user_info = github_service.verify_token(token)
     if user_info.get("valid"):
@@ -531,7 +719,8 @@ def github_status():
                 "html_url": user_info.get("html_url"),
                 "scopes": user_info.get("scopes", [])
             },
-            "auth_type": "pat"
+            "auth_type": "pat",
+            "account": None
         }
     else:
         return {
@@ -540,19 +729,21 @@ def github_status():
             "oauth_available": oauth_available,
             "user": None,
             "auth_type": "invalid",
-            "error": user_info.get("error", "Invalid or expired token")
+            "error": user_info.get("error", "Invalid or expired token"),
+            "account": None
         }
 
 @app.get("/api/github/oauth/url")
-def github_oauth_url(redirect_uri: Optional[str] = None):
+def github_oauth_url(redirect_uri: Optional[str] = None, user: Optional[AuthUser] = Depends(get_optional_user)):
     if not github_service.is_oauth_configured():
         raise HTTPException(status_code=400, detail="GitHub OAuth is not configured on the server")
-    url = github_service.get_oauth_url(redirect_uri=redirect_uri)
+    url = github_service.get_oauth_url(redirect_uri=redirect_uri, user_id=user.id if user else None)
     return {"url": url}
 
 @app.get("/api/github/oauth/callback")
 def github_oauth_callback(code: str, state: str, redirect_uri: Optional[str] = None):
-    if not github_service.validate_oauth_state(state):
+    state_data = github_service.pop_oauth_state(state)
+    if not state_data:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state parameter")
 
     success, token, err = github_service.exchange_oauth_code(code, redirect_uri=redirect_uri)
@@ -563,11 +754,30 @@ def github_oauth_callback(code: str, state: str, redirect_uri: Optional[str] = N
     if not user_info.get("valid"):
         raise HTTPException(status_code=400, detail=user_info.get("error", "Failed to verify token with GitHub"))
 
-    github_service.set_session_token(token)
+    user_id = state_data.get("user_id")
+    if user_id and supabase_manager.is_configured:
+        try:
+            encrypted_token = token_encryptor.encrypt(token)
+            supabase_manager.save_github_connection(
+                user_id=user_id,
+                github_user_id=str(user_info.get("id", "")),
+                github_login=user_info.get("login", ""),
+                encrypted_token=encrypted_token,
+                avatar_url=user_info.get("avatar_url"),
+                html_url=user_info.get("html_url"),
+                scopes=user_info.get("scopes", []),
+                auth_type="oauth"
+            )
+        except Exception as e:
+            logger.error(f"Failed to persist OAuth connection in Supabase: {e}")
+            raise HTTPException(status_code=500, detail="Failed to persist encrypted GitHub credentials.")
+    else:
+        github_service.set_session_token(token)
+
     return RedirectResponse(url="/?github_connected=true", status_code=303)
 
 @app.post("/api/github/connect")
-def github_connect(request: GitHubConnectRequest):
+def github_connect(request: GitHubConnectRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
     token = request.token.strip()
     if not token:
         raise HTTPException(status_code=400, detail="Token cannot be empty")
@@ -576,9 +786,28 @@ def github_connect(request: GitHubConnectRequest):
     if not user_info.get("valid"):
         raise HTTPException(status_code=400, detail=user_info.get("error", "Invalid or expired GitHub credentials"))
     
-    github_service.set_session_token(token)
+    if user and supabase_manager.is_configured:
+        try:
+            encrypted_token = token_encryptor.encrypt(token)
+            supabase_manager.save_github_connection(
+                user_id=user.id,
+                github_user_id=str(user_info.get("id", "")),
+                github_login=user_info.get("login", ""),
+                encrypted_token=encrypted_token,
+                avatar_url=user_info.get("avatar_url"),
+                html_url=user_info.get("html_url"),
+                scopes=user_info.get("scopes", []),
+                auth_type="pat"
+            )
+        except Exception as e:
+            logger.error(f"Failed to persist PAT connection in Supabase: {e}")
+            raise HTTPException(status_code=500, detail="Failed to persist encrypted GitHub credentials.")
+    else:
+        github_service.set_session_token(token)
+
     return {
         "status": "connected",
+        "connected": True,
         "user": {
             "login": user_info.get("login"),
             "name": user_info.get("name"),
@@ -589,13 +818,15 @@ def github_connect(request: GitHubConnectRequest):
     }
 
 @app.post("/api/github/disconnect")
-def github_disconnect():
+def github_disconnect(user: Optional[AuthUser] = Depends(get_optional_user)):
+    if user and supabase_manager.is_configured:
+        supabase_manager.delete_github_connection(user.id)
     github_service.set_session_token(None)
     return {"status": "disconnected"}
 
 @app.get("/api/github/repos")
-def github_repos(q: Optional[str] = None, page: int = 1):
-    token = github_service.get_token()
+def github_repos(q: Optional[str] = None, page: int = 1, user: Optional[AuthUser] = Depends(get_optional_user)):
+    token = resolve_github_token(user)
     if not token:
         raise HTTPException(status_code=401, detail="GitHub not connected. Please connect your GitHub account.")
     
@@ -603,8 +834,8 @@ def github_repos(q: Optional[str] = None, page: int = 1):
     return {"repos": repos}
 
 @app.get("/api/github/repos/{owner}/{repo}/branches")
-def github_branches(owner: str, repo: str):
-    token = github_service.get_token()
+def github_branches(owner: str, repo: str, user: Optional[AuthUser] = Depends(get_optional_user)):
+    token = resolve_github_token(user)
     if not token:
         raise HTTPException(status_code=401, detail="GitHub not connected. Please connect your GitHub account.")
     
@@ -615,8 +846,8 @@ def github_branches(owner: str, repo: str):
     return {"branches": branches}
 
 @app.post("/api/github/workspace")
-def create_github_workspace(request: GitHubWorkspaceRequest):
-    token = github_service.get_token(request.token)
+def create_github_workspace(request: GitHubWorkspaceRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
+    token = resolve_github_token(user, request.token)
     if not token:
         raise HTTPException(status_code=401, detail="GitHub not connected. Please connect your GitHub account.")
         
@@ -641,7 +872,8 @@ def create_github_workspace(request: GitHubWorkspaceRequest):
                 "repo": repo,
                 "target_branch": branch,
                 "starting_commit_sha": commit_sha,
-                "clone_url": f"https://github.com/{owner}/{repo}.git"
+                "clone_url": f"https://github.com/{owner}/{repo}.git",
+                "user_id": user.id if user else None
             }
         )
         return {
@@ -658,7 +890,8 @@ def create_github_workspace(request: GitHubWorkspaceRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/github/publish/readiness")
-def github_publish_readiness(workspace_id: str):
+def github_publish_readiness(workspace_id: str, user: Optional[AuthUser] = Depends(get_optional_user)):
+    verify_workspace_access(workspace_id, user)
     meta = workspace_manager.get_workspace_metadata(workspace_id)
     if not meta or meta.get("source_type") != "github":
         return {
@@ -668,7 +901,7 @@ def github_publish_readiness(workspace_id: str):
         }
         
     verification_status = meta.get("verification_status", "UNVERIFIED")
-    token = github_service.get_token()
+    token = resolve_github_token(user)
     
     diverged = False
     remote_sha = None
@@ -705,7 +938,8 @@ def github_publish_readiness(workspace_id: str):
     }
 
 @app.post("/api/github/publish")
-def github_publish(request: GitHubPublishRequest):
+def github_publish(request: GitHubPublishRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
+    verify_workspace_access(request.workspace_id, user)
     meta = workspace_manager.get_workspace_metadata(request.workspace_id)
     if not meta or meta.get("source_type") != "github":
         raise HTTPException(status_code=400, detail="Workspace is not a valid GitHub repository workspace.")
@@ -718,7 +952,7 @@ def github_publish(request: GitHubPublishRequest):
             detail=f"Publication gate blocked: Workspace verification status is '{verification_status}', but only 'FIX VERIFIED' patches may be published."
         )
         
-    token = github_service.get_token(request.token)
+    token = resolve_github_token(user, request.token)
     if not token:
         raise HTTPException(status_code=401, detail="GitHub credentials not found. Please connect your GitHub account.")
         
@@ -762,10 +996,58 @@ def github_publish(request: GitHubPublishRequest):
             is_mock_mode=nebius_client.mock_mode,
             custom_notes=request.custom_notes
         )
-        workspace_manager.update_workspace_metadata(request.workspace_id, {"published_pr": pr_result})
+        meta["published_pr"] = pr_result
+        workspace_manager.update_workspace_metadata(request.workspace_id, meta)
+
+        # Update or record in repair_sessions table if user is authenticated
+        if user and supabase_manager.is_configured:
+            supabase_manager.save_repair_session(
+                user_id=user.id,
+                session_data={
+                    "workspace_id": request.workspace_id,
+                    "repo_url": meta.get("clone_url") or f"https://github.com/{meta['owner']}/{meta['repo']}",
+                    "issue_description": meta.get("issue_description", ""),
+                    "mode": meta.get("mode", "targeted"),
+                    "status": "published",
+                    "diagnosis": meta.get("diagnosis", {}),
+                    "findings": meta.get("findings", []),
+                    "patch": meta.get("patch", ""),
+                    "verification_status": verification_status,
+                    "verification_details": meta.get("verification_details", {}),
+                    "pr_url": pr_result.get("pr_url"),
+                    "pr_number": pr_result.get("pr_number"),
+                    "branch": pr_result.get("branch")
+                }
+            )
+
         return pr_result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# ---------------------------------------------------------
+# User Repair History Endpoints
+# ---------------------------------------------------------
+
+@app.get("/api/history")
+def get_repair_history(limit: int = 20, user: AuthUser = Depends(get_current_user)):
+    """Fetch persistent repair history scoped strictly to the authenticated user."""
+    sessions = supabase_manager.list_repair_sessions(user.id, limit=limit)
+    return {"status": "success", "sessions": sessions}
+
+@app.post("/api/history")
+def save_repair_history(request: SaveSessionRequest, user: AuthUser = Depends(get_current_user)):
+    """Save or synchronize a repair session to persistent storage."""
+    session_data = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    session_id = supabase_manager.save_repair_session(user.id, session_data)
+    return {"status": "success", "session_id": session_id}
+
+@app.delete("/api/history/{session_id}")
+def delete_repair_history(session_id: str, user: AuthUser = Depends(get_current_user)):
+    """Delete a repair session strictly owned by the authenticated user."""
+    success = supabase_manager.delete_repair_session(user.id, session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Repair session not found or access denied")
+    return {"status": "success"}
 
 # ---------------------------------------------------------
 # Static Frontend Serving (Single-Service Production Mode)

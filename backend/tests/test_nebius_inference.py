@@ -380,3 +380,137 @@ def test_investigate_mock_and_live():
     assert len(live_res["findings"]) == 1
     assert live_res["findings"][0]["title"] == "Decouple AST parser from keystroke handler"
 
+def test_timeout_handling_never_retries():
+    """Verify that an APITimeoutError fails fast without retrying and raises NebiusInferenceError."""
+    client = NebiusClient(api_key="dummy_real_key", timeout=30.0)
+    mock_openai = MagicMock()
+    client.client = mock_openai
+
+    req = httpx.Request("POST", "https://api.studio.nebius.ai/v1/chat/completions")
+    mock_openai.chat.completions.create.side_effect = APITimeoutError(request=req)
+
+    with pytest.raises(NebiusInferenceError) as exc_info:
+        client.investigate(
+            intent="improvement",
+            issue_description="improve code",
+            project_profile={"languages": ["Python"], "manifests": [], "test_command": "", "readme_summary": ""},
+            code_context="def foo(): pass"
+        )
+
+    # Exactly 1 attempt made — NEVER retried
+    assert mock_openai.chat.completions.create.call_count == 1
+    err_text = str(exc_info.value).lower()
+    assert "timed out" in err_text
+    assert "30.0s" in err_text or "deadline" in err_text
+
+def test_transient_retry_success():
+    """Verify transient error (e.g. 503) is retried at most once and succeeds on 2nd attempt."""
+    client = NebiusClient(api_key="dummy_real_key")
+    mock_openai = MagicMock()
+    client.client = mock_openai
+
+    req = httpx.Request("POST", "https://api.studio.nebius.ai/v1/chat/completions")
+    resp_503 = httpx.Response(503, request=req)
+    error_503 = APIStatusError(message="Service Unavailable", response=resp_503, body=None)
+
+    success_choice = MagicMock()
+    success_choice.message.content = json.dumps({"summary": "OK", "findings": []})
+    success_choice.finish_reason = "stop"
+    success_choice.message.refusal = None
+    success_response = MagicMock(choices=[success_choice])
+
+    # Fails once with 503, succeeds on retry
+    mock_openai.chat.completions.create.side_effect = [error_503, success_response]
+
+    with patch("time.sleep") as mock_sleep:
+        res = client.investigate(
+            intent="improvement",
+            issue_description="audit",
+            project_profile={},
+            code_context="pass"
+        )
+        assert mock_sleep.called
+        assert mock_openai.chat.completions.create.call_count == 2
+        assert res["summary"] == "OK"
+
+def test_transient_retry_exhausted():
+    """Verify persistent transient error stops retrying after 1 retry (2 attempts total)."""
+    client = NebiusClient(api_key="dummy_real_key")
+    mock_openai = MagicMock()
+    client.client = mock_openai
+
+    req = httpx.Request("POST", "https://api.studio.nebius.ai/v1/chat/completions")
+    resp_503 = httpx.Response(503, request=req)
+    error_503 = APIStatusError(message="Service Unavailable", response=resp_503, body=None)
+
+    mock_openai.chat.completions.create.side_effect = [error_503, error_503]
+
+    with patch("time.sleep"):
+        with pytest.raises(NebiusInferenceError) as exc_info:
+            client.investigate(
+                intent="improvement",
+                issue_description="audit",
+                project_profile={},
+                code_context="pass"
+            )
+        assert mock_openai.chat.completions.create.call_count == 2
+        assert "503" in str(exc_info.value)
+
+def test_nemotron_disables_thinking_extra_body():
+    """Verify nvidia/Nemotron-3_5-Lightning configures chat_template_kwargs: enable_thinking=False."""
+    nemotron_client = NebiusClient(api_key="dummy_key", model_name="nvidia/Nemotron-3_5-Lightning")
+    extra_kwargs = nemotron_client._get_model_extra_kwargs()
+    assert extra_kwargs == {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+
+    other_client = NebiusClient(api_key="dummy_key", model_name="meta-llama/Llama-3-70b")
+    assert other_client._get_model_extra_kwargs() == {}
+
+def test_investigate_fallback_to_reasoning():
+    """Verify findings are parsed from reasoning if content is empty."""
+    client = NebiusClient(api_key="dummy_real_key")
+    mock_openai = MagicMock()
+    client.client = mock_openai
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = ""
+    mock_choice.message.reasoning = json.dumps({
+        "summary": "Recovered from reasoning",
+        "findings": [{"id": "finding-1", "title": "Reasoning Finding"}]
+    })
+    mock_choice.finish_reason = "stop"
+    mock_choice.message.refusal = None
+    mock_openai.chat.completions.create.return_value = MagicMock(choices=[mock_choice])
+
+    res = client.investigate(
+        intent="improvement",
+        issue_description="audit",
+        project_profile={},
+        code_context="pass"
+    )
+    assert res["summary"] == "Recovered from reasoning"
+    assert len(res["findings"]) == 1
+    assert res["findings"][0]["title"] == "Reasoning Finding"
+
+def test_empty_response_raises_error():
+    """Verify empty response without content or reasoning raises NebiusInferenceError."""
+    client = NebiusClient(api_key="dummy_real_key")
+    mock_openai = MagicMock()
+    client.client = mock_openai
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = ""
+    mock_choice.message.reasoning = ""
+    mock_choice.finish_reason = "stop"
+    mock_choice.message.refusal = None
+    mock_openai.chat.completions.create.return_value = MagicMock(choices=[mock_choice])
+
+    with pytest.raises(NebiusInferenceError) as exc_info:
+        client.investigate(
+            intent="improvement",
+            issue_description="audit",
+            project_profile={},
+            code_context="pass"
+        )
+    assert "empty response" in str(exc_info.value).lower()
+
+

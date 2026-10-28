@@ -39,25 +39,38 @@ class GitHubService:
     def is_oauth_configured(self) -> bool:
         return bool(self.client_id and self.client_secret)
 
-    def create_oauth_state(self) -> str:
+    def create_oauth_state(self, user_id: Optional[str] = None) -> str:
         # Purge states older than 10 minutes
         now = time.time()
-        self.oauth_states = {s: exp for s, exp in self.oauth_states.items() if exp > now}
+        self.oauth_states = {
+            s: data for s, data in self.oauth_states.items() 
+            if (data.get("expires_at", 0) if isinstance(data, dict) else data) > now
+        }
         state = secrets.token_urlsafe(32)
-        self.oauth_states[state] = now + 600.0  # 10 minutes
+        self.oauth_states[state] = {
+            "expires_at": now + 600.0,
+            "user_id": user_id
+        }
         return state
 
-    def validate_oauth_state(self, state: str) -> bool:
+    def pop_oauth_state(self, state: str) -> Optional[Dict[str, Any]]:
+        """Validate and pop OAuth state, returning metadata including user_id if valid."""
         now = time.time()
-        if state in self.oauth_states and self.oauth_states[state] > now:
-            del self.oauth_states[state]
-            return True
-        return False
+        if state in self.oauth_states:
+            data = self.oauth_states.pop(state)
+            exp = data.get("expires_at", 0) if isinstance(data, dict) else data
+            if exp > now:
+                return data if isinstance(data, dict) else {"expires_at": exp, "user_id": None}
+        return None
 
-    def get_oauth_url(self, redirect_uri: Optional[str] = None) -> Optional[str]:
+    def validate_oauth_state(self, state: str) -> bool:
+        """Compatibility check for OAuth state validation."""
+        return bool(self.pop_oauth_state(state))
+
+    def get_oauth_url(self, redirect_uri: Optional[str] = None, user_id: Optional[str] = None) -> Optional[str]:
         if not self.is_oauth_configured():
             return None
-        state = self.create_oauth_state()
+        state = self.create_oauth_state(user_id=user_id)
         url = (
             f"https://github.com/login/oauth/authorize?"
             f"client_id={self.client_id}&"

@@ -9,3 +9,6 @@ unidiff==0.7.5
 pytest==8.0.0
 httpx==0.26.0
 requests==2.34.2
+cryptography>=42.0.0
+supabase>=2.3.0
+pyjwt[crypto]>=2.8.0

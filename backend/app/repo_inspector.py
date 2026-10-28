@@ -17,7 +17,8 @@ IGNORE_EXTS = {
     '.exe', '.dll', '.so', '.dylib', '.pyc', '.pyo', '.pyd',
     '.map', '.min.js', '.min.css', '.vsix', '.zip', '.tar', '.gz',
     '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp', '.mp4',
-    '.pdf', '.wasm', '.bin', '.dat', '.lock', '.class', '.jar'
+    '.pdf', '.wasm', '.bin', '.dat', '.lock', '.class', '.jar',
+    '.tmLanguage', '.sublime-syntax', '.tmTheme'
 }
 
 SOURCE_EXTS = {
@@ -94,7 +95,8 @@ class RepoInspector:
                     break
 
                 ext = os.path.splitext(file)[1].lower()
-                if ext in IGNORE_EXTS or file.endswith("-lock.json"):
+                if (ext in IGNORE_EXTS or file.endswith("-lock.json") or 
+                    file.endswith(".lock") or file.endswith(".tmLanguage.json")):
                     continue
 
                 full_path = os.path.join(root, file)
@@ -165,20 +167,47 @@ class RepoInspector:
         if not profile["test_command"]:
             profile["test_command"] = RepoInspector._detect_test_command(real_ws_path, profile)
 
-        # 4. Identify core files (manifests, main entrypoints, non-test files sorted by size/priority)
+        # 4. Identify core files (entrypoints, key source files, manifests, excluding duplicates & docs)
         core_files: List[str] = []
+        seen_basenames = set()
+
+        entrypoint_names = {
+            "main.py", "app.py", "cli.py", "index.ts", "index.js", "server.ts",
+            "server.js", "lib.rs", "main.rs", "main.go", "extension.ts"
+        }
+
+        # 1. First pass: recognized entrypoints
         for rel_path, _ in all_files:
             base = os.path.basename(rel_path)
-            if base in profile["manifests"] or base in ["README.md", "easytype.py", "main.py", "app.py", "index.ts", "extension.ts"]:
-                if rel_path not in core_files:
-                    core_files.append(rel_path)
-
-        # Fill up to 10 files
-        for rel_path, _ in sorted(all_files, key=lambda x: x[1], reverse=True):
-            if rel_path not in core_files and rel_path not in profile["test_files"]:
+            if base in entrypoint_names and base not in seen_basenames:
                 core_files.append(rel_path)
-            if len(core_files) >= 10:
-                break
+                seen_basenames.add(base)
+
+        # 2. Second pass: manifests
+        for rel_path in profile["manifests"]:
+            base = os.path.basename(rel_path)
+            if rel_path not in core_files and base not in seen_basenames:
+                core_files.append(rel_path)
+                seen_basenames.add(base)
+
+        # 3. Third pass: largest source code files (excluding tests, docs, configs, and duplicate basenames)
+        for rel_path, _ in sorted(all_files, key=lambda x: x[1], reverse=True):
+            base = os.path.basename(rel_path)
+            ext = os.path.splitext(base)[1].lower()
+            if ext in [".md", ".txt", ".json", ".lock", ".toml", ".yaml", ".yml"]:
+                continue
+            if rel_path not in core_files and rel_path not in profile["test_files"] and base not in seen_basenames:
+                core_files.append(rel_path)
+                seen_basenames.add(base)
+        # 4. Fallback if core_files is empty (e.g. documentation-only or minimal repos)
+        if not core_files:
+            for rel_path, _ in all_files:
+                base = os.path.basename(rel_path)
+                if base not in seen_basenames:
+                    core_files.append(rel_path)
+                    seen_basenames.add(base)
+                if len(core_files) >= 5:
+                    break
 
         profile["core_files"] = core_files
         return ProjectProfile(profile)
@@ -230,22 +259,37 @@ class RepoInspector:
         return ""
 
     @staticmethod
-    def build_bounded_context(workspace_path: str, profile: Optional[Dict[str, Any]] = None, max_total_chars: int = 24000) -> str:
+    def build_bounded_context(workspace_path: str, profile: Optional[Dict[str, Any]] = None, max_total_chars: int = 14000) -> str:
         """Construct bounded, security-redacted code context for LLM investigation."""
         real_ws_path = os.path.realpath(workspace_path)
         if profile is None:
             profile = RepoInspector.inspect(real_ws_path)
         snippets: List[str] = []
         total_chars = 0
+        seen_basenames = set()
 
-        # Prioritize core files + up to 2 test files
+        # Prioritize core files + up to 1 test file (if not already included)
         target_files = list(profile.get("core_files", []))
-        test_files = profile.get("test_files", [])[:2]
+        test_files = profile.get("test_files", [])[:1]
         for tf in test_files:
             if tf not in target_files:
                 target_files.append(tf)
 
+        PROGRAMMING_EXTS = {
+            '.py', '.ts', '.tsx', '.js', '.jsx', '.rs', '.go', '.c', '.cpp',
+            '.h', '.hpp', '.java', '.esy', '.sh'
+        }
+        has_code_files = any(os.path.splitext(f)[1].lower() in PROGRAMMING_EXTS for f in target_files)
+
         for rel_path in target_files:
+            base = os.path.basename(rel_path)
+            # Skip documentation files from code blocks if actual source code files exist (overview already captures README summary)
+            ext = os.path.splitext(base)[1].lower()
+            if has_code_files and ext in [".md", ".txt"]:
+                continue
+            if base in seen_basenames:
+                continue
+
             full_path = os.path.join(real_ws_path, rel_path)
             if not os.path.isfile(full_path):
                 continue
@@ -255,10 +299,11 @@ class RepoInspector:
                     snippet = f"--- {rel_path} ---\n[File truncated: Too large]\n"
                     snippets.append(snippet)
                     total_chars += len(snippet)
+                    seen_basenames.add(base)
                     continue
 
                 # Per-file cap to prevent single-file domination
-                file_cap = 4000
+                file_cap = 3500
                 with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read(file_cap + 500)
                     if len(content) > file_cap:
@@ -273,6 +318,7 @@ class RepoInspector:
 
                 snippets.append(snippet)
                 total_chars += len(snippet)
+                seen_basenames.add(base)
             except Exception as e:
                 logger.debug(f"Could not read file {rel_path}: {e}")
 

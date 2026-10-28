@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import time
 import logging
 from typing import Dict, Any, Optional
 from openai import (
@@ -165,7 +166,7 @@ class NebiusClient:
         self.api_key = api_key if api_key is not None else os.getenv("NEBIUS_API_KEY", "mock_key")
         self.base_url = base_url if base_url is not None else os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
         self.model_name = model_name if model_name is not None else os.getenv("NEBIUS_MODEL_NAME", "nvidia/Nemotron-3_5-Lightning")
-        self.timeout = timeout if timeout is not None else float(os.getenv("NEBIUS_TIMEOUT", "90.0"))
+        self.timeout = timeout if timeout is not None else float(os.getenv("NEBIUS_TIMEOUT", "60.0"))
 
         # Mock mode is active if api_key is empty, None, or 'mock_key'
         self.mock_mode = (not self.api_key) or (self.api_key.strip() in ["mock_key", ""])
@@ -175,7 +176,7 @@ class NebiusClient:
                 base_url=self.base_url,
                 api_key=self.api_key.strip(),
                 timeout=self.timeout,
-                max_retries=2
+                max_retries=0  # Disables client-level retry loop; targeted retries are managed by _execute_with_retry
             )
         else:
             self.client = None
@@ -190,7 +191,7 @@ class NebiusClient:
         self.api_key = os.getenv("NEBIUS_API_KEY", "mock_key")
         self.base_url = os.getenv("NEBIUS_BASE_URL", "https://api.studio.nebius.ai/v1/")
         self.model_name = os.getenv("NEBIUS_MODEL_NAME", "nvidia/Nemotron-3_5-Lightning")
-        self.timeout = float(os.getenv("NEBIUS_TIMEOUT", "90.0"))
+        self.timeout = float(os.getenv("NEBIUS_TIMEOUT", "60.0"))
         self.mock_mode = (not self.api_key) or (self.api_key.strip() in ["mock_key", ""])
 
         if not self.mock_mode:
@@ -198,10 +199,88 @@ class NebiusClient:
                 base_url=self.base_url,
                 api_key=self.api_key.strip(),
                 timeout=self.timeout,
-                max_retries=2
+                max_retries=0
             )
         else:
             self.client = None
+
+    def _get_model_extra_kwargs(self) -> Dict[str, Any]:
+        """Return model-specific request tuning parameters (disables runaway internal reasoning loop on Nemotron)."""
+        if "nemotron" in self.model_name.lower():
+            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        return {}
+
+    def _execute_with_retry(self, call_fn, operation_name: str, prompt_for_logging: Optional[str] = None) -> Any:
+        """
+        Execute Nebius API call with targeted single retry for transient status/rate-limit errors.
+        Never retries APITimeoutError (fails fast with actionable diagnostic).
+        Measures and logs prompt size, model, elapsed time, finish reason, and response size without logging secrets.
+        """
+        prompt_chars = len(prompt_for_logging) if prompt_for_logging else 0
+        approx_tokens = prompt_chars // 4
+        logger.info(
+            f"Nebius inference starting: operation={operation_name}, model={self.model_name}, "
+            f"prompt_chars={prompt_chars}, approx_tokens={approx_tokens}"
+        )
+
+        max_transient_retries = 1
+        for attempt in range(max_transient_retries + 1):
+            t0 = time.time()
+            try:
+                response = call_fn()
+                elapsed = time.time() - t0
+                choice = response.choices[0] if response and response.choices else None
+                finish_reason = choice.finish_reason if choice else "unknown"
+                content_len = len(choice.message.content or "") if choice and choice.message else 0
+                reasoning_len = len(getattr(choice.message, "reasoning", "") or "") if choice and choice.message else 0
+                logger.info(
+                    f"Nebius inference succeeded: operation={operation_name}, model={self.model_name}, "
+                    f"elapsed={elapsed:.2f}s, finish_reason={finish_reason}, content_chars={content_len}, "
+                    f"reasoning_chars={reasoning_len}"
+                )
+                return response
+            except APITimeoutError as e:
+                elapsed = time.time() - t0
+                logger.error(
+                    f"Nebius inference timed out: operation={operation_name}, model={self.model_name}, "
+                    f"elapsed={elapsed:.2f}s (deadline={self.timeout}s). No retry."
+                )
+                raise NebiusInferenceError(
+                    f"Nebius API request timed out after {self.timeout}s while {operation_name}. "
+                    "The model was unable to complete the request within the deadline. "
+                    "Try scoping your request or narrowing the code context."
+                ) from e
+            except (RateLimitError, APIConnectionError) as e:
+                elapsed = time.time() - t0
+                if attempt < max_transient_retries:
+                    logger.warning(
+                        f"Nebius inference transient error: operation={operation_name}, "
+                        f"error={type(e).__name__}, elapsed={elapsed:.2f}s. Retrying once in 1.5s..."
+                    )
+                    time.sleep(1.5)
+                    continue
+                err_msg = format_api_error(e, self.model_name, self.base_url)
+                logger.error(f"Nebius inference failed after retry: operation={operation_name}, error={err_msg}")
+                raise NebiusInferenceError(f"Live Nebius {operation_name} failed: {err_msg}") from e
+            except APIStatusError as e:
+                elapsed = time.time() - t0
+                if e.status_code in (502, 503, 504) and attempt < max_transient_retries:
+                    logger.warning(
+                        f"Nebius inference upstream {e.status_code}: operation={operation_name}, "
+                        f"elapsed={elapsed:.2f}s. Retrying once in 1.5s..."
+                    )
+                    time.sleep(1.5)
+                    continue
+                err_msg = format_api_error(e, self.model_name, self.base_url)
+                logger.error(f"Nebius inference failed: operation={operation_name}, status={e.status_code}, error={err_msg}")
+                raise NebiusInferenceError(f"Live Nebius {operation_name} failed: {err_msg}") from e
+            except Exception as e:
+                if isinstance(e, NebiusInferenceError):
+                    raise
+                elapsed = time.time() - t0
+                err_msg = format_api_error(e, self.model_name, self.base_url)
+                logger.error(f"Nebius inference error: operation={operation_name}, elapsed={elapsed:.2f}s, error={err_msg}")
+                raise NebiusInferenceError(f"Live Nebius {operation_name} failed: {err_msg}") from e
 
     def diagnose(self, issue_description: str, code_context: str) -> Dict[str, Any]:
         """Diagnose code defect. Uses mock mode if configured; otherwise invokes live Nebius model."""
@@ -250,42 +329,43 @@ Respond ONLY with a JSON object:
     "patch": "git unified diff starting with --- a/ and +++ b/"
 }}
 """
-        try:
-            response = self.client.chat.completions.create(
+        sys_msg = "detailed thinking off\nYou are an automated code repair system. Output pure JSON."
+        extra_kwargs = self._get_model_extra_kwargs()
+
+        def _call():
+            return self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": "You are an automated code repair system. Output pure JSON."},
+                    {"role": "system", "content": sys_msg},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                max_tokens=3072
+                max_tokens=3072,
+                **extra_kwargs
             )
 
-            raw_content = response.choices[0].message.content
-            if not raw_content and hasattr(response.choices[0].message, "reasoning"):
-                raw_content = getattr(response.choices[0].message, "reasoning", "")
-            if not raw_content:
-                raise NebiusInferenceError("Nebius model returned empty response without patch content.")
+        response = self._execute_with_retry(_call, operation_name="generating patch", prompt_for_logging=prompt)
 
-            patch = extract_unified_diff(raw_content)
-            if not patch or not ("--- " in patch and "+++ " in patch):
-                raise NebiusInferenceError("Nebius model failed to generate a valid unified diff.")
+        raw_content = response.choices[0].message.content
+        if not raw_content and hasattr(response.choices[0].message, "reasoning"):
+            raw_content = getattr(response.choices[0].message, "reasoning", "")
+        if not raw_content:
+            raise NebiusInferenceError("Nebius model returned empty response without patch content.")
 
-            return patch
+        patch = extract_unified_diff(raw_content)
+        if not patch or not ("--- " in patch and "+++ " in patch):
+            raise NebiusInferenceError("Nebius model failed to generate a valid unified diff.")
 
-        except Exception as e:
-            if isinstance(e, NebiusInferenceError):
-                raise
-            err_msg = format_api_error(e, self.model_name, self.base_url)
-            logger.error(f"Live Nebius patch generation failed: {err_msg}")
-            # Do NOT fall back to mock when live inference is configured
-            raise NebiusInferenceError(f"Live Nebius patch generation failed: {err_msg}") from e
+        return patch
 
-    def _call_model(self, prompt: str, system_prompt: Optional[str] = None, max_tokens: int = 12288) -> Dict[str, Any]:
-        try:
-            sys_msg = system_prompt or "You are a precise diagnostic assistant. Always respond in pure JSON."
-            response = self.client.chat.completions.create(
+    def _call_model(self, prompt: str, system_prompt: Optional[str] = None, max_tokens: int = 4096) -> Dict[str, Any]:
+        base_sys_msg = system_prompt or "You are a precise diagnostic assistant. Always respond in pure JSON."
+        sys_msg = f"detailed thinking off\n{base_sys_msg}"
+        extra_kwargs = self._get_model_extra_kwargs()
+
+        def _call():
+            return self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
                     {"role": "system", "content": sys_msg},
@@ -293,54 +373,49 @@ Respond ONLY with a JSON object:
                 ],
                 temperature=0.2,
                 response_format={"type": "json_object"},
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                **extra_kwargs
             )
 
-            if not response.choices:
-                raise NebiusInferenceError("Nebius model returned 0 completion choices.")
+        response = self._execute_with_retry(_call, operation_name="diagnosing defect", prompt_for_logging=prompt)
 
-            choice = response.choices[0]
+        if not response.choices:
+            raise NebiusInferenceError("Nebius model returned 0 completion choices.")
 
-            refusal = getattr(choice.message, "refusal", None)
-            if refusal and isinstance(refusal, str) and refusal.strip():
-                raise NebiusInferenceError(f"Nebius model refused the request: {refusal}")
+        choice = response.choices[0]
 
-            if choice.finish_reason == "content_filter":
-                raise NebiusInferenceError("Nebius model response was filtered by content safety policy.")
+        refusal = getattr(choice.message, "refusal", None)
+        if refusal and isinstance(refusal, str) and refusal.strip():
+            raise NebiusInferenceError(f"Nebius model refused the request: {refusal}")
 
-            content = choice.message.content
-            if choice.finish_reason == "length" and (not content or not content.strip()):
+        if choice.finish_reason == "content_filter":
+            raise NebiusInferenceError("Nebius model response was filtered by content safety policy.")
+
+        content = choice.message.content
+        raw_content = content
+        if not raw_content and hasattr(choice.message, "reasoning"):
+            raw_content = getattr(choice.message, "reasoning", "") or ""
+
+        if not raw_content or not raw_content.strip():
+            if choice.finish_reason == "length":
                 raise NebiusInferenceError(
                     "Nebius model reached completion token limit (finish_reason: length). "
                     "The model's internal reasoning exhausted available output tokens. "
                     "Please scope the request or narrow the code context."
                 )
-
-            raw_content = content
-            if not raw_content and hasattr(choice.message, "reasoning"):
-                raw_content = getattr(choice.message, "reasoning", "")
-
-            if not raw_content or not raw_content.strip():
-                raise NebiusInferenceError("Nebius model returned empty response without diagnostic JSON.")
-
+        try:
             data = extract_json_object(raw_content)
+        except ValueError as e:
+            raise NebiusInferenceError(f"Nebius model returned malformed JSON: {e}") from e
 
-            # Ensure all required schema keys are present
-            data.setdefault("diagnosis", "Defect identified from code context.")
-            data.setdefault("evidence", "Context inspection.")
-            data.setdefault("files_to_modify", [])
-            data.setdefault("proposed_fix_description", "Apply minimal corrective patch.")
-            data.setdefault("regression_risks", "Low risk under standard test suite.")
+        # Ensure all required schema keys are present
+        data.setdefault("diagnosis", "Defect identified from code context.")
+        data.setdefault("evidence", "Context inspection.")
+        data.setdefault("files_to_modify", [])
+        data.setdefault("proposed_fix_description", "Apply minimal corrective patch.")
+        data.setdefault("regression_risks", "Low risk under standard test suite.")
 
-            return data
-
-        except Exception as e:
-            if isinstance(e, NebiusInferenceError):
-                raise
-            err_msg = format_api_error(e, self.model_name, self.base_url)
-            logger.error(f"Live Nebius diagnosis call failed: {err_msg}")
-            # Do NOT fall back to mock when live inference is configured
-            raise NebiusInferenceError(f"Live Nebius diagnosis failed: {err_msg}") from e
+        return data
 
     def investigate(self, intent: str, issue_description: str, project_profile: Dict[str, Any], code_context: str) -> Dict[str, Any]:
         """Perform open-ended repository investigation (bug discovery or general improvement)."""
@@ -371,7 +446,7 @@ Project Profile:
 - Detected Manifests: {manifests}
 - Configured / Detected Test Command: {test_command}
 - Project Overview:
-{readme[:1200]}
+{readme[:1000]}
 
 Repository Source Code Context:
 {code_context}
@@ -379,25 +454,26 @@ Repository Source Code Context:
 CRITICAL RULES:
 1. Ground every finding in specific files and evidence visible in the code context. Do NOT generate generic or boilerplate advice.
 2. Focus strictly on the top 3 to 5 highest-impact, most actionable findings.
-3. If evidence is insufficient for a claim, state that clearly or omit the claim.
-4. For each finding, provide:
+3. Keep field values concise: 1-2 sentences for summaries, explanations, and proposed fixes.
+4. If evidence is insufficient for a claim, state that clearly or omit the claim.
+5. For each finding, provide:
    - "id": "finding-1", "finding-2", etc.
    - "title": Short, descriptive title.
    - "category": "defect" | "maintainability" | "performance" | "security" | "testing"
    - "severity": "high" | "medium" | "low"
    - "confidence": "high" | "medium" | "low"
-   - "impact": Concrete benefit or consequence.
+   - "impact": 1-sentence concrete benefit or consequence.
    - "risk": "Low" | "Medium" | "High"
    - "files": Array of affected file paths.
    - "line_numbers": Array of line numbers if known (or empty).
-   - "evidence": Specific code snippet or pattern from context.
-   - "explanation": Concise explanation of the issue or improvement.
+   - "evidence": Key code snippet from context.
+   - "explanation": 1-2 sentence concise explanation.
    - "action": "repair" (if targeted code patch is feasible) or "review".
-   - "proposed_fix": Concrete, practical recommendation or patch strategy.
+   - "proposed_fix": 1-2 sentence concrete fix strategy.
 
 Respond ONLY with a valid JSON object matching this schema:
 {{
-    "summary": "Concise executive overview of the repository analysis.",
+    "summary": "1-2 sentence concise executive overview of the repository analysis.",
     "findings": [
         {{
             "id": "finding-1",
@@ -417,58 +493,58 @@ Respond ONLY with a valid JSON object matching this schema:
     ]
 }}
 """
-        try:
-            response = self.client.chat.completions.create(
+        sys_msg = f"detailed thinking off\nYou are an expert {role_desc}. Output pure JSON."
+        extra_kwargs = self._get_model_extra_kwargs()
+
+        def _call():
+            return self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": f"You are an expert {role_desc}. Always output pure JSON."},
+                    {"role": "system", "content": sys_msg},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
                 response_format={"type": "json_object"},
-                max_tokens=16384
+                max_tokens=4096,
+                **extra_kwargs
             )
 
-            if not response.choices:
-                raise NebiusInferenceError("Nebius model returned 0 completion choices.")
+        response = self._execute_with_retry(_call, operation_name="investigating repository", prompt_for_logging=prompt)
 
-            choice = response.choices[0]
-            refusal = getattr(choice.message, "refusal", None)
-            if refusal and isinstance(refusal, str) and refusal.strip():
-                raise NebiusInferenceError(f"Nebius model refused the request: {refusal}")
+        if not response.choices:
+            raise NebiusInferenceError("Nebius model returned 0 completion choices.")
 
-            if choice.finish_reason == "content_filter":
-                raise NebiusInferenceError("Nebius model response was filtered by content safety policy.")
+        choice = response.choices[0]
+        refusal = getattr(choice.message, "refusal", None)
+        if refusal and isinstance(refusal, str) and refusal.strip():
+            raise NebiusInferenceError(f"Nebius model refused the request: {refusal}")
 
-            content = choice.message.content
-            if choice.finish_reason == "length" and (not content or not content.strip()):
+        if choice.finish_reason == "content_filter":
+            raise NebiusInferenceError("Nebius model response was filtered by content safety policy.")
+
+        content = choice.message.content
+        raw_content = content
+        if not raw_content and hasattr(choice.message, "reasoning"):
+            raw_content = getattr(choice.message, "reasoning", "") or ""
+
+        if not raw_content or not raw_content.strip():
+            if choice.finish_reason == "length":
                 raise NebiusInferenceError(
                     "Nebius model reached completion token limit (finish_reason: length). "
                     "The analysis exhausted the maximum allowed tokens. Try scoping the request to a specific module."
                 )
-
-            raw_content = content
-            if not raw_content and hasattr(choice.message, "reasoning"):
-                raw_content = getattr(choice.message, "reasoning", "")
-
-            if not raw_content or not raw_content.strip():
-                raise NebiusInferenceError("Nebius model returned empty response without investigation findings.")
-
+        try:
             data = extract_json_object(raw_content)
-            findings = data.get("findings") or data.get("recommendations") or []
-            summary = data.get("summary") or "Repository investigation completed."
+        except ValueError as e:
+            raise NebiusInferenceError(f"Nebius model returned malformed JSON: {e}") from e
 
-            return {
-                "summary": summary,
-                "findings": findings
-            }
+        findings = data.get("findings") or data.get("recommendations") or []
+        summary = data.get("summary") or "Repository investigation completed."
 
-        except Exception as e:
-            if isinstance(e, NebiusInferenceError):
-                raise
-            err_msg = format_api_error(e, self.model_name, self.base_url)
-            logger.error(f"Live Nebius investigation failed: {err_msg}")
-            raise NebiusInferenceError(f"Live Nebius investigation failed: {err_msg}") from e
+        return {
+            "summary": summary,
+            "findings": findings
+        }
 
     def _mock_investigate(self, intent: str, issue_description: str, project_profile: Dict[str, Any], code_context: str) -> Dict[str, Any]:
         """Deterministic simulation of repository investigation for offline tests."""

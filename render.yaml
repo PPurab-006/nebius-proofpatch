@@ -19,7 +19,7 @@ services:
       - key: NEBIUS_MODEL_NAME
         value: nvidia/Nemotron-3_5-Lightning
       - key: NEBIUS_TIMEOUT
-        value: "90.0"
+        value: "60.0"
       - key: CORS_ORIGINS
         value: "*"
       - key: GITHUB_CLIENT_ID
@@ -27,4 +27,12 @@ services:
       - key: GITHUB_CLIENT_SECRET
         sync: false
       - key: GITHUB_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PATCHWORKS_ENCRYPTION_KEY
         sync: false
