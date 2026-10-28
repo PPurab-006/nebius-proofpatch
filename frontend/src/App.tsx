@@ -6,7 +6,6 @@ import {
   determineProcessingStage,
   useMutteringPhrase,
   IdleWelcomeCard,
-  ActiveProcessingCard,
   ActiveProcessingBanner,
 } from './panelPersonality';
 
@@ -2236,8 +2235,8 @@ ${
 
             {/* Right Column: Unified Diff Viewer, Structured Findings & Sandbox Verification */}
             <div className="lg:col-span-7 space-y-6">
-              {/* Active Processing Banner when processing on existing findings/repair */}
-              {(loading || batchRepairing) && (diagnosis || repair) && (
+              {/* Active Processing Banner when processing */}
+              {isProcessing && (
                 <ActiveProcessingBanner
                   phrase={mutteringPhrase}
                   fading={mutteringFading}
@@ -3056,15 +3055,8 @@ ${
                     })}
                   </div>
                 </div>
-              ) : isProcessing ? (
-                /* Active Processing State */
-                <ActiveProcessingCard
-                  phrase={mutteringPhrase}
-                  fading={mutteringFading}
-                  technicalStatus={currentTechnicalStatus}
-                />
               ) : (
-                /* Idle Welcome State */
+                /* Welcome State */
                 <IdleWelcomeCard greeting={idleGreeting} />
               )}
             </div>
