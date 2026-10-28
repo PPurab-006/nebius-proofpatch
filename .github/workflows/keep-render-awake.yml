@@ -1,0 +1,54 @@
+name: Keep Patchworks Awake
+
+'on':
+  schedule:
+    # Run every 10 minutes to help prevent Render free-tier instance spinning down
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    name: Ping Production Health Endpoint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Send Health Check Ping
+        run: |
+          ENDPOINT="https://patchworks-workbench.onrender.com/api/health"
+          echo "Pinging production health endpoint: $ENDPOINT"
+
+          # Perform HTTP request with fail-on-error, silent with error display, and timeout
+          RESPONSE=$(curl --fail --silent --show-error --max-time 30 "$ENDPOINT")
+          CURL_STATUS=$?
+
+          if [ $CURL_STATUS -ne 0 ]; then
+            echo "Error: Health check curl request failed with exit code $CURL_STATUS"
+            exit 1
+          fi
+
+          echo "Health check response received:"
+          echo "$RESPONSE"
+
+          # Validate that response JSON has "status": "ok", resilient to whitespace
+          IS_OK=$(echo "$RESPONSE" | python3 -c '
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              if data.get("status") == "ok":
+                  print("VALID")
+              else:
+                  print("INVALID")
+          except Exception:
+              print("MALFORMED")
+          ')
+
+          if [ "$IS_OK" != "VALID" ]; then
+            echo "Error: Unexpected health check response (status was not 'ok')"
+            exit 1
+          fi
+
+          echo "Health check succeeded: Service is awake and responsive."
