@@ -148,7 +148,7 @@ async def health_check():
     }
 
 @app.post("/api/upload")
-async def upload_zip(file: UploadFile = File(...)):
+def upload_zip(file: UploadFile = File(...)):
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="Only .zip files are allowed")
 
@@ -165,7 +165,7 @@ async def upload_zip(file: UploadFile = File(...)):
             os.remove(temp_zip.name)
 
 @app.post("/api/benchmark/workspace")
-async def create_benchmark_workspace(request: BenchmarkWorkspaceRequest):
+def create_benchmark_workspace(request: BenchmarkWorkspaceRequest):
     try:
         ws_id = workspace_manager.create_workspace_from_benchmark(request.fixture)
         metadata = workspace_manager.get_workspace_metadata(ws_id)
@@ -179,7 +179,7 @@ async def create_benchmark_workspace(request: BenchmarkWorkspaceRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/benchmarks")
-async def list_benchmarks():
+def list_benchmarks():
     fixtures_dir = get_benchmark_fixtures_dir()
     benchmarks = []
     if os.path.isdir(fixtures_dir):
@@ -190,7 +190,7 @@ async def list_benchmarks():
     return {"status": "success", "benchmarks": benchmarks}
 
 @app.post("/api/inspect")
-async def inspect_repository(request: InspectRequest):
+def inspect_repository(request: InspectRequest):
     ws_id = request.workspace_id
     is_new_workspace = False
 
@@ -229,7 +229,7 @@ async def inspect_repository(request: InspectRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/diagnose")
-async def diagnose(request: DiagnosisRequest):
+def diagnose(request: DiagnosisRequest):
     ws_id = request.workspace_id
     is_new_workspace = False
 
@@ -344,7 +344,7 @@ async def diagnose(request: DiagnosisRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/repair")
-async def propose_repair(request: RepairRequest):
+def propose_repair(request: RepairRequest):
     ws_id = request.workspace_id
     is_new_workspace = False
 
@@ -490,7 +490,7 @@ async def propose_repair(request: RepairRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/rollback")
-async def rollback(request: RollbackRequest):
+def rollback(request: RollbackRequest):
     success = workspace_manager.rollback_patch(request.workspace_id)
     if success:
         return {"status": "success", "message": "Rollback successful"}
@@ -498,7 +498,7 @@ async def rollback(request: RollbackRequest):
         raise HTTPException(status_code=400, detail="Rollback failed")
 
 @app.delete("/api/workspace/{workspace_id}")
-async def cleanup(workspace_id: str):
+def cleanup(workspace_id: str):
     workspace_manager.cleanup_workspace(workspace_id)
     return {"status": "success"}
 
@@ -507,7 +507,7 @@ async def cleanup(workspace_id: str):
 # ---------------------------------------------------------
 
 @app.get("/api/github/status")
-async def github_status():
+def github_status():
     token = github_service.get_token()
     oauth_available = github_service.is_oauth_configured()
     if not token:
@@ -544,14 +544,14 @@ async def github_status():
         }
 
 @app.get("/api/github/oauth/url")
-async def github_oauth_url(redirect_uri: Optional[str] = None):
+def github_oauth_url(redirect_uri: Optional[str] = None):
     if not github_service.is_oauth_configured():
         raise HTTPException(status_code=400, detail="GitHub OAuth is not configured on the server")
     url = github_service.get_oauth_url(redirect_uri=redirect_uri)
     return {"url": url}
 
 @app.get("/api/github/oauth/callback")
-async def github_oauth_callback(code: str, state: str, redirect_uri: Optional[str] = None):
+def github_oauth_callback(code: str, state: str, redirect_uri: Optional[str] = None):
     if not github_service.validate_oauth_state(state):
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state parameter")
 
@@ -567,7 +567,7 @@ async def github_oauth_callback(code: str, state: str, redirect_uri: Optional[st
     return RedirectResponse(url="/?github_connected=true", status_code=303)
 
 @app.post("/api/github/connect")
-async def github_connect(request: GitHubConnectRequest):
+def github_connect(request: GitHubConnectRequest):
     token = request.token.strip()
     if not token:
         raise HTTPException(status_code=400, detail="Token cannot be empty")
@@ -589,12 +589,12 @@ async def github_connect(request: GitHubConnectRequest):
     }
 
 @app.post("/api/github/disconnect")
-async def github_disconnect():
+def github_disconnect():
     github_service.set_session_token(None)
     return {"status": "disconnected"}
 
 @app.get("/api/github/repos")
-async def github_repos(q: Optional[str] = None, page: int = 1):
+def github_repos(q: Optional[str] = None, page: int = 1):
     token = github_service.get_token()
     if not token:
         raise HTTPException(status_code=401, detail="GitHub not connected. Please connect your GitHub account.")
@@ -603,7 +603,7 @@ async def github_repos(q: Optional[str] = None, page: int = 1):
     return {"repos": repos}
 
 @app.get("/api/github/repos/{owner}/{repo}/branches")
-async def github_branches(owner: str, repo: str):
+def github_branches(owner: str, repo: str):
     token = github_service.get_token()
     if not token:
         raise HTTPException(status_code=401, detail="GitHub not connected. Please connect your GitHub account.")
@@ -615,7 +615,7 @@ async def github_branches(owner: str, repo: str):
     return {"branches": branches}
 
 @app.post("/api/github/workspace")
-async def create_github_workspace(request: GitHubWorkspaceRequest):
+def create_github_workspace(request: GitHubWorkspaceRequest):
     token = github_service.get_token(request.token)
     if not token:
         raise HTTPException(status_code=401, detail="GitHub not connected. Please connect your GitHub account.")
@@ -658,7 +658,7 @@ async def create_github_workspace(request: GitHubWorkspaceRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/api/github/publish/readiness")
-async def github_publish_readiness(workspace_id: str):
+def github_publish_readiness(workspace_id: str):
     meta = workspace_manager.get_workspace_metadata(workspace_id)
     if not meta or meta.get("source_type") != "github":
         return {
@@ -705,7 +705,7 @@ async def github_publish_readiness(workspace_id: str):
     }
 
 @app.post("/api/github/publish")
-async def github_publish(request: GitHubPublishRequest):
+def github_publish(request: GitHubPublishRequest):
     meta = workspace_manager.get_workspace_metadata(request.workspace_id)
     if not meta or meta.get("source_type") != "github":
         raise HTTPException(status_code=400, detail="Workspace is not a valid GitHub repository workspace.")
