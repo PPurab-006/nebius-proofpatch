@@ -659,3 +659,20 @@ def test_13_batch_repair_rollback_cannot_discard_unrelated_workspace_changes(mon
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
+def test_resolve_targeted_test_mapping():
+    from backend.app.main import resolve_targeted_test
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "backend/tests"), exist_ok=True)
+        with open(os.path.join(td, "backend/tests/test_api.py"), "w") as f:
+            f.write("# test")
+        with open(os.path.join(td, "backend/tests/test_github.py"), "w") as f:
+            f.write("# test")
+        with open(os.path.join(td, "test_custom.py"), "w") as f:
+            f.write("# test")
+
+        assert resolve_targeted_test(td, "backend/app/main.py") == "backend/tests/test_api.py"
+        assert resolve_targeted_test(td, "backend/app/github_service.py") == "backend/tests/test_github.py"
+        assert resolve_targeted_test(td, "custom.py") == "test_custom.py"
+        assert resolve_targeted_test(td, "nonexistent.py") is None
+
+

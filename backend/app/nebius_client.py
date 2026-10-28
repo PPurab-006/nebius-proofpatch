@@ -158,19 +158,14 @@ def extract_unified_diff(content: str) -> str:
             if line.startswith("@@"):
                 in_hunk = True
 
-            cleaned_line = line
-            # Strip trailing JSON escape artifacts like "}, or "} or ", or trailing quote
-            if cleaned_line.endswith('"},'):
-                cleaned_line = cleaned_line[:-3]
-            elif cleaned_line.endswith('"}'):
-                cleaned_line = cleaned_line[:-2]
-            elif cleaned_line.endswith('",'):
-                cleaned_line = cleaned_line[:-2]
-            elif cleaned_line.endswith('"'):
-                cleaned_line = cleaned_line[:-1]
-
-            diff_lines.append(cleaned_line)
+            diff_lines.append(line)
         text = "\n".join(diff_lines)
+
+    text = text.rstrip()
+    for suffix in ('"},', '"} ', '", ', '",'):
+        if text.endswith(suffix):
+            text = text[:-len(suffix)].rstrip()
+            break
 
     return text.strip() + "\n"
 

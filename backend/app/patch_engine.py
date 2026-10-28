@@ -3,6 +3,7 @@ import re
 import difflib
 import subprocess
 import logging
+from typing import Optional
 from unidiff import PatchSet
 
 logger = logging.getLogger(__name__)
@@ -92,30 +93,36 @@ def fix_hunk_headers(patch: str) -> str:
     return "\n".join(fixed_lines) + "\n"
 
 def strip_leaked_json_artifacts(patch: str) -> str:
-    """Strip leaked JSON delimiters like '"},' or '"} ' at the end of diff lines."""
+    """Strip leaked JSON delimiters like '"},' or '"} ' at the end of diff lines while preserving valid code."""
+    if not patch:
+        return ""
     cleaned_lines = []
+    suffixes = ('"},', '"} ', '", ')
     for line in patch.splitlines():
         if line.startswith(("+", "-", " ")):
-            if line.endswith('"},'):
-                line = line[:-3]
-            elif line.endswith('"}'):
-                line = line[:-2]
-            elif line.endswith('",'):
-                line = line[:-2]
-            elif line.endswith('"} '):
-                line = line[:-3]
-            elif line.endswith('", '):
-                line = line[:-3]
+            for s in suffixes:
+                if line.endswith(s):
+                    line = line[:-len(s)]
+                    break
         cleaned_lines.append(line)
     return "\n".join(cleaned_lines) + "\n"
 
 class PatchEngine:
     @staticmethod
-    def apply_patch(workspace_path: str, patch_content: str) -> bool:
+    def apply_patch(workspace_path: str, patch_content: str, target_file_hint: Optional[str] = None) -> bool:
         if not patch_content or not patch_content.strip():
             return False
 
         sanitized_patch = strip_leaked_json_artifacts(fix_hunk_headers(normalize_diff_indentation(patch_content)))
+
+        # If headers are missing (e.g. LLM returned only hunk) and target_file_hint is provided, synthesize headers
+        if target_file_hint:
+            clean_hint = target_file_hint.replace("\\", "/").lstrip("/")
+            if clean_hint.startswith("b/") or clean_hint.startswith("a/"):
+                clean_hint = clean_hint[2:]
+            if not ("--- " in sanitized_patch and "+++ " in sanitized_patch) and "@@" in sanitized_patch:
+                sanitized_patch = f"--- a/{clean_hint}\n+++ b/{clean_hint}\n{sanitized_patch}"
+
         patch_file_path = os.path.join(workspace_path, "repair.patch")
         try:
             with open(patch_file_path, "w") as f:
@@ -220,7 +227,7 @@ class PatchEngine:
 
             # Fallback 5: Semantic fuzzy chunk ingestion (handles LLM indentation drops and line miscalculations)
             logger.info("Retrying patch via semantic fuzzy chunk ingestion")
-            if PatchEngine.fuzzy_apply_patch(workspace_path, sanitized_patch):
+            if PatchEngine.fuzzy_apply_patch(workspace_path, sanitized_patch, target_file_hint=target_file_hint):
                 return True
 
             logger.error(f"Failed to apply patch: {result.stderr or result_whitespace.stderr or result_patch_cmd.stderr}")
@@ -234,7 +241,7 @@ class PatchEngine:
                 os.remove(patch_file_path)
 
     @staticmethod
-    def fuzzy_apply_patch(workspace_path: str, patch_content: str) -> bool:
+    def fuzzy_apply_patch(workspace_path: str, patch_content: str, target_file_hint: Optional[str] = None) -> bool:
         """
         Semantic chunk replacement fallback for LLM-generated diffs where:
         - Line numbers are approximate.
@@ -252,8 +259,15 @@ class PatchEngine:
             if not match_plus:
                 match_minus = re.search(r"^---\s+(?:a/)?(\S+)", section, re.MULTILINE)
                 if not match_minus:
-                    continue
-                target_rel = match_minus.group(1)
+                    if target_file_hint:
+                        clean_hint = target_file_hint.replace("\\", "/").lstrip("/")
+                        if clean_hint.startswith("b/") or clean_hint.startswith("a/"):
+                            clean_hint = clean_hint[2:]
+                        target_rel = clean_hint
+                    else:
+                        continue
+                else:
+                    target_rel = match_minus.group(1)
             else:
                 target_rel = match_plus.group(1)
 
@@ -352,9 +366,8 @@ class PatchEngine:
                             if not line.strip():
                                 new_lines.append("")
                             else:
-                                cleaned = re.sub(r'[\"\'\}\],]+$', '', line)
-                                rel = cleaned[:len(cleaned) - len(cleaned.lstrip())][min_indent:]
-                                new_lines.append(f"{base_indent}{rel}{cleaned.lstrip()}")
+                                rel = line[:len(line) - len(line.lstrip())][min_indent:]
+                                new_lines.append(f"{base_indent}{rel}{line.lstrip()}")
 
                         new_target_lines = target_lines[:match_start] + new_lines + target_lines[match_end + 1:]
                         file_content = "\n".join(new_target_lines)
@@ -390,9 +403,8 @@ class PatchEngine:
                             if not line.strip():
                                 new_lines.append("")
                             else:
-                                cleaned = re.sub(r'[\"\'\}\],]+$', '', line)
-                                rel = cleaned[:len(cleaned) - len(cleaned.lstrip())][min_indent:]
-                                new_lines.append(f"{base_indent}{rel}{cleaned.lstrip()}")
+                                rel = line[:len(line) - len(line.lstrip())][min_indent:]
+                                new_lines.append(f"{base_indent}{rel}{line.lstrip()}")
                         for c in context_after:
                             new_lines.append(f"{base_indent}{c}")
 

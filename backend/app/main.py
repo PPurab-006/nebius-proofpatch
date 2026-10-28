@@ -472,6 +472,58 @@ def diagnose(request: DiagnosisRequest, user: Optional[AuthUser] = Depends(get_o
             workspace_manager.cleanup_workspace(ws_id)
         raise HTTPException(status_code=400, detail=str(e))
 
+def resolve_targeted_test(workspace_path: str, fault_file: Optional[str]) -> Optional[str]:
+    """Find the most specific test file for a given fault file to avoid full-suite timeouts."""
+    if not fault_file or not workspace_path:
+        return None
+
+    clean_fault = os.path.normpath(fault_file.replace("\\", "/")).lstrip("/")
+    base_name = os.path.basename(clean_fault)
+    stem, _ = os.path.splitext(base_name)
+
+    # 1. Exact repository mappings for well-known modules
+    repo_mappings = {
+        "main.py": "backend/tests/test_api.py",
+        "app.py": "backend/tests/test_api.py",
+        "github_service.py": "backend/tests/test_github.py",
+        "nebius_client.py": "backend/tests/test_nebius_inference.py",
+        "workspace.py": "backend/tests/test_workspace.py",
+        "patch_engine.py": "backend/tests/test_patch_engine.py",
+        "repo_inspector.py": "backend/tests/test_repo_inspector.py",
+        "reporting.py": "backend/tests/test_reporting.py",
+        "security.py": "backend/tests/test_security.py",
+        "auth.py": "backend/tests/test_auth_and_persistence.py",
+    }
+
+    if base_name in repo_mappings:
+        candidate = repo_mappings[base_name]
+        if os.path.isfile(os.path.join(workspace_path, candidate)):
+            return candidate
+
+    # 2. Heuristic search: test_<stem>.py, <stem>_test.py in test dirs or adjacent
+    search_candidates = [
+        f"test_{stem}.py",
+        f"{stem}_test.py",
+        f"tests/test_{stem}.py",
+        f"backend/tests/test_{stem}.py",
+        f"test/test_{stem}.py",
+    ]
+    for cand in search_candidates:
+        if os.path.isfile(os.path.join(workspace_path, cand)):
+            return cand
+
+    # 3. Search under tests directory for any test file containing the stem
+    for test_dir in ["tests", "backend/tests", "test"]:
+        abs_test_dir = os.path.join(workspace_path, test_dir)
+        if os.path.isdir(abs_test_dir):
+            for root, _, files in os.walk(abs_test_dir):
+                for f in files:
+                    if f.startswith("test_") and stem in f and f.endswith(".py"):
+                        rel_path = os.path.relpath(os.path.join(root, f), workspace_path)
+                        return rel_path.replace("\\", "/")
+
+    return None
+
 @app.post("/api/repair")
 def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(get_optional_user)):
     ws_id = request.workspace_id
@@ -567,7 +619,8 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
                 "verification_status": "PATCH GENERATION FAILED"
             }
 
-        applied = PatchEngine.apply_patch(ws_path, patch)
+        target_hint = focus_files[0] if (focus_files and len(focus_files) > 0) else None
+        applied = PatchEngine.apply_patch(ws_path, patch, target_file_hint=target_hint)
         if not applied:
             workspace_manager.update_workspace_metadata(
                 ws_id,
@@ -597,7 +650,13 @@ def propose_repair(request: RepairRequest, user: Optional[AuthUser] = Depends(ge
             test_cmd = meta.get("test_command")
 
         if test_cmd:
-            test_details = workspace_manager.run_tests(ws_id, test_cmd)
+            active_cmd = test_cmd
+            if test_cmd.strip() == "pytest":
+                targeted = resolve_targeted_test(ws_path, target_hint)
+                if targeted:
+                    active_cmd = f"pytest {targeted}"
+                    logger.info(f"Targeting verification test in propose_repair: {active_cmd} for {target_hint}")
+            test_details = workspace_manager.run_tests(ws_id, active_cmd)
             # returncode == -1 indicates execution failure (e.g. malformed command, disallowed base command, timeout, missing binary)
             if test_details.get("returncode") == -1:
                 verification_result = "VERIFICATION INCOMPLETE"
@@ -1402,7 +1461,7 @@ def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends
             continue
 
         # Safely apply patch
-        applied = PatchEngine.apply_patch(ws_path, patch)
+        applied = PatchEngine.apply_patch(ws_path, patch, target_file_hint=fault_file)
         if not applied:
             repo.git.reset("--hard", checkpoint_sha)
             repo.git.clean("-fd")
@@ -1421,7 +1480,14 @@ def batch_repair(request: BatchRepairRequest, user: Optional[AuthUser] = Depends
         test_details = None
         verification_status = "UNVERIFIED"
         if test_cmd:
-            test_details = workspace_manager.run_tests(request.workspace_id, test_cmd)
+            active_cmd = test_cmd
+            if test_cmd.strip() == "pytest":
+                targeted = resolve_targeted_test(ws_path, fault_file)
+                if targeted:
+                    active_cmd = f"pytest {targeted}"
+                    logger.info(f"Targeting verification test in batch repair: {active_cmd} for {fault_file}")
+
+            test_details = workspace_manager.run_tests(request.workspace_id, active_cmd)
             if test_details.get("returncode") == 0 and test_details.get("success") is True:
                 verification_status = "FIX VERIFIED"
             elif test_details.get("returncode") == -1:

@@ -412,7 +412,7 @@ class WorkspaceManager:
         env["PYTHONPATH"] = workspace_path
         env["PYTHONNOUSERSITE"] = "1"
 
-        test_timeout = int(os.getenv("TEST_TIMEOUT", "60"))
+        test_timeout = int(os.getenv("TEST_TIMEOUT", "120"))
         try:
             # We explicitly use shell=False and pass the array of arguments to prevent injection
             result = subprocess.run(
@@ -430,11 +430,13 @@ class WorkspaceManager:
                 "stderr": result.stderr,
                 "returncode": result.returncode
             }
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as te:
+             partial_out = te.stdout.decode("utf-8", errors="ignore") if isinstance(te.stdout, bytes) else (te.stdout or "")
+             partial_err = te.stderr.decode("utf-8", errors="ignore") if isinstance(te.stderr, bytes) else (te.stderr or "")
              return {
                 "success": False,
-                "stdout": "",
-                "stderr": f"Test execution timed out after {test_timeout} seconds",
+                "stdout": partial_out,
+                "stderr": f"Test execution timed out after {test_timeout} seconds\n{partial_err}".strip(),
                 "returncode": -1
              }
         except Exception as e:

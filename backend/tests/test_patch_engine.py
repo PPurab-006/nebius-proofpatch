@@ -105,4 +105,69 @@ def test_fuzzy_apply_patch_preserves_nested_indentation_and_strips_json_artifact
         assert 'raise ValueError("Missing")' in content
         assert '"},' not in content
 
+def test_patch_engine_preserves_dict_and_string_literals():
+    """Verify that trailing braces and string quotes in valid Python code are never stripped."""
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test'")
+
+        sample_code = """def parse_response(candidate, user):
+    if not candidate:
+        return None
+    return candidate
+"""
+        with open(os.path.join(temp_repo, "client.py"), "w") as f:
+            f.write(sample_code)
+
+        os.system(f"cd {temp_repo} && git add client.py && git commit -m 'Initial'")
+
+        # Patch adding dict literal ending in } and f-string ending in "
+        patch = """--- a/client.py
++++ b/client.py
+@@ -1,4 +1,6 @@
+ def parse_response(candidate, user):
+     if not candidate:
++        detail=f"Failed to decrypt stored token for user {user.id}: {e}"
++        return {"_raw": candidate}
+-    return candidate
++    return {"data": candidate}
+"""
+        success = PatchEngine.apply_patch(temp_repo, patch)
+        assert success is True
+
+        with open(os.path.join(temp_repo, "client.py"), "r") as f:
+            content = f.read()
+
+        compile(content, "client.py", "exec")
+        assert 'return {"_raw": candidate}' in content
+        assert 'detail=f"Failed to decrypt stored token for user {user.id}: {e}"' in content
+        assert 'return {"data": candidate}' in content
+
+def test_patch_engine_target_file_hint_without_diff_headers():
+    """Verify that patches missing diff headers apply when target_file_hint is provided."""
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test'")
+
+        sample_code = """def add(a, b):
+    return a - b
+"""
+        with open(os.path.join(temp_repo, "calc.py"), "w") as f:
+            f.write(sample_code)
+
+        os.system(f"cd {temp_repo} && git add calc.py && git commit -m 'Initial'")
+
+        # Patch without --- a/ and +++ b/ headers
+        headerless_patch = """@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+"""
+        success = PatchEngine.apply_patch(temp_repo, headerless_patch, target_file_hint="calc.py")
+        assert success is True
+
+        with open(os.path.join(temp_repo, "calc.py"), "r") as f:
+            content = f.read()
+
+        assert "return a + b" in content
+
+
 
