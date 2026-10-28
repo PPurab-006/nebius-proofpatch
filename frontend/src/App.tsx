@@ -44,10 +44,7 @@ import {
   Shield,
   Copy,
   Check,
-  CheckSquare,
-  Square,
   ChevronRight,
-  ChevronDown,
   Menu,
   X,
   Folder,
@@ -132,34 +129,6 @@ export interface FindingPrStatus {
   reason?: string | null;
 }
 
-export interface BatchRepairFindingResult {
-  finding_id: string;
-  title: string;
-  status: 'verified' | 'repaired' | 'failed' | 'skipped' | 'rolled_back';
-  verification_status: string;
-  error?: string;
-  patch?: string;
-  commit_sha?: string;
-  test_details?: {
-    success: boolean;
-    stdout: string;
-    stderr: string;
-    returncode: number;
-  };
-}
-
-export interface BatchRepairResponse {
-  status: 'success' | 'partial_success' | 'failed';
-  all_succeeded: boolean;
-  summary: {
-    total: number;
-    successful: number;
-    failed: number;
-    skipped: number;
-  };
-  results: BatchRepairFindingResult[];
-  cumulative_patch?: string;
-}
 
 export interface ProjectProfile {
   languages: string[];
@@ -362,15 +331,9 @@ export default function App() {
   const [diagnosis, setDiagnosis] = useState<DiagnosisResponse | null>(null);
   const [repair, setRepair] = useState<RepairResponse | null>(null);
 
-  // PR Status Awareness & Batch Repair States
+  // PR Status Awareness States
   const [findingPrStatuses, setFindingPrStatuses] = useState<Record<string, FindingPrStatus>>({});
   const [prStatusLoading, setPrStatusLoading] = useState(false);
-  const [batchMode, setBatchMode] = useState<'selected' | 'all' | 'individual'>('selected');
-  const [selectedFindingIds, setSelectedFindingIds] = useState<string[]>([]);
-  const [batchRepairing, setBatchRepairing] = useState(false);
-  const [batchResult, setBatchResult] = useState<BatchRepairResponse | null>(null);
-  const [confirmAllModalOpen, setConfirmAllModalOpen] = useState(false);
-  const [expandedBatchFindingId, setExpandedBatchFindingId] = useState<string | null>(null);
   const [pipelineStep, setPipelineStep] = useState<number>(0);
   // 0 = idle, 1 = repo prep, 2 = diagnosing, 3 = generating patch, 4 = applying, 5 = verifying, 6 = complete
   const [loading, setLoading] = useState(false);
@@ -379,9 +342,9 @@ export default function App() {
 
   // Code-Ingestion Panel Personality States
   const [idleGreeting, setIdleGreeting] = useState(() => getRandomIdleGreeting());
-  const isProcessing = loading || batchRepairing;
+  const isProcessing = loading;
   const { stage: currentProcessingStage, technicalStatus: currentTechnicalStatus } =
-    determineProcessingStage(pipelineStep, loadingMessage, batchRepairing);
+    determineProcessingStage(pipelineStep, loadingMessage);
   const { phrase: mutteringPhrase, fading: mutteringFading } = useMutteringPhrase(
     isProcessing,
     currentProcessingStage
@@ -782,80 +745,6 @@ export default function App() {
     }
   };
 
-  const toggleSelectFinding = (findingId: string) => {
-    setSelectedFindingIds((prev) =>
-      prev.includes(findingId) ? prev.filter((id) => id !== findingId) : [...prev, findingId]
-    );
-  };
-
-  const selectAllEligible = () => {
-    if (!diagnosis?.findings) return;
-    const eligible = diagnosis.findings
-      .filter((f) => {
-        const pr = findingPrStatuses[f.id];
-        return !pr || pr.is_eligible_for_repair;
-      })
-      .map((f) => f.id);
-    setSelectedFindingIds(eligible);
-  };
-
-  const deselectAll = () => {
-    setSelectedFindingIds([]);
-  };
-
-  const handleBatchRepair = async (findingIdsToRepair: string[]) => {
-    if (!workspaceId || findingIdsToRepair.length === 0) return;
-    setBatchRepairing(true);
-    setLoading(true);
-    setLoadingMessage(`Executing safe serialized batch repair across ${findingIdsToRepair.length} findings...`);
-    setPipelineStep(5);
-    setError('');
-    try {
-      const res = await axios.post<BatchRepairResponse>('/api/repair/batch', {
-        workspace_id: workspaceId,
-        finding_ids: findingIdsToRepair,
-        test_command: testCommand ? testCommand.trim() : undefined
-      });
-      setBatchResult(res.data);
-      if (res.data.cumulative_patch) {
-        setRepair({
-          status: 'success',
-          workspace_id: workspaceId,
-          patch: res.data.cumulative_patch,
-          patch_applied: res.data.summary.successful > 0,
-          verification_status: res.data.all_succeeded
-            ? 'FIX VERIFIED'
-            : res.data.summary.successful > 0
-            ? 'PARTIAL FIX'
-            : 'FIX FAILED'
-        });
-        setRightPanelView('patch');
-      }
-      setPipelineStep(6);
-      fetchFindingsPrStatus(workspaceId);
-      if (ghWorkspaceInfo || inputType === 'github') {
-        checkPublishReadiness(workspaceId);
-      }
-      if (diagnosis) {
-        saveSession(workspaceId, diagnosis.diagnosis, {
-          status: 'success',
-          workspace_id: workspaceId,
-          patch: res.data.cumulative_patch || '',
-          patch_applied: res.data.summary.successful > 0,
-          verification_status: res.data.all_succeeded ? 'FIX VERIFIED' : 'PARTIAL FIX'
-        });
-      }
-    } catch (err: any) {
-      setError(err.response?.data?.detail || err.message);
-      setPipelineStep(3);
-    } finally {
-      setBatchRepairing(false);
-      setLoading(false);
-      setLoadingMessage('');
-      setConfirmAllModalOpen(false);
-    }
-  };
-
   const handlePublishPR = async () => {
     if (!workspaceId) return;
     setPublishing(true);
@@ -1103,18 +992,6 @@ export default function App() {
     }
   };
 
-  // Synchronize eligible findings with selection in batch mode
-  useEffect(() => {
-    if (diagnosis?.findings) {
-      const eligible = diagnosis.findings
-        .filter((f) => {
-          const pr = findingPrStatuses[f.id];
-          return !pr || pr.is_eligible_for_repair;
-        })
-        .map((f) => f.id);
-      setSelectedFindingIds(eligible);
-    }
-  }, [diagnosis?.findings, findingPrStatuses]);
 
   const handleRepair = async () => {
     if (!diagnosis) return;
@@ -2649,65 +2526,17 @@ ${
                     <p>{diagnosis.investigation?.summary || diagnosis.diagnosis.diagnosis}</p>
                   </div>
 
-                  {/* Batch Action Toolbar */}
-                  <div className="bg-[#11140F] border border-[#242820] rounded-lg p-3 space-y-3">
+                  {/* Candidate Findings Management & PR Tracking Header */}
+                  <div className="bg-[#11140F] border border-[#242820] rounded-lg p-3.5 space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#242820] pb-2.5">
-                      {/* Mode Selector Tabs */}
-                      <div className="flex items-center gap-1 bg-[#050505] p-1 rounded-md border border-[#242820]">
-                        <button
-                          type="button"
-                          onClick={() => setBatchMode('selected')}
-                          className={`px-3 py-1 rounded text-xs font-mono font-bold transition-all flex items-center gap-1.5 ${
-                            batchMode === 'selected'
-                              ? 'bg-[#B7FF3C] text-[#050505] glow-lime-sm'
-                              : 'text-[#969B90] hover:text-[#F4F5F0]'
-                          }`}
-                        >
-                          <CheckSquare className="w-3.5 h-3.5" />
-                          <span>Repair Selected</span>
-                          {selectedFindingIds.length > 0 && (
-                            <span
-                              className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
-                                batchMode === 'selected' ? 'bg-[#050505] text-[#B7FF3C]' : 'bg-[#1A1F14] text-[#B7FF3C]'
-                              }`}
-                            >
-                              {selectedFindingIds.length}
-                            </span>
-                          )}
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => setBatchMode('all')}
-                          className={`px-3 py-1 rounded text-xs font-mono font-bold transition-all flex items-center gap-1.5 ${
-                            batchMode === 'all'
-                              ? 'bg-[#B7FF3C] text-[#050505] glow-lime-sm'
-                              : 'text-[#969B90] hover:text-[#F4F5F0]'
-                          }`}
-                        >
-                          <Layers className="w-3.5 h-3.5" />
-                          <span>Repair All</span>
-                          <span
-                            className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
-                              batchMode === 'all' ? 'bg-[#050505] text-[#B7FF3C]' : 'bg-[#1A1F14] text-[#969B90]'
-                            }`}
-                          >
-                            {diagnosis.findings.filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length}
-                          </span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() => setBatchMode('individual')}
-                          className={`px-3 py-1 rounded text-xs font-mono font-bold transition-all flex items-center gap-1.5 ${
-                            batchMode === 'individual'
-                              ? 'bg-[#B7FF3C] text-[#050505] glow-lime-sm'
-                              : 'text-[#969B90] hover:text-[#F4F5F0]'
-                          }`}
-                        >
-                          <Sparkles className="w-3.5 h-3.5" />
-                          <span>Repair Individually</span>
-                        </button>
+                      <div className="flex items-center gap-2">
+                        <FileCode className="w-4 h-4 text-[#B7FF3C]" />
+                        <h3 className="text-xs font-mono font-bold uppercase tracking-wider text-[#F4F5F0]">
+                          Candidate Findings List
+                        </h3>
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-[#050505] text-[#B7FF3C] border border-[#242820] font-bold">
+                          {diagnosis.findings.length} Total
+                        </span>
                       </div>
 
                       {/* PR Status Refresh Button */}
@@ -2723,201 +2552,32 @@ ${
                       </button>
                     </div>
 
-                    {/* Mode Sub-bar */}
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
-                      {batchMode === 'selected' && (
-                        <>
-                          <div className="flex items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={selectAllEligible}
-                              className="text-[11px] text-[#B7FF3C] hover:underline hover:text-[#D4FF8A]"
-                            >
-                              Select All Eligible
-                            </button>
-                            <span className="text-[#3A4034]">&bull;</span>
-                            <button
-                              type="button"
-                              onClick={deselectAll}
-                              className="text-[11px] text-[#969B90] hover:underline hover:text-[#F4F5F0]"
-                            >
-                              Clear Selection
-                            </button>
-                            <span className="text-[11px] text-[#969B90] ml-1">
-                              ({selectedFindingIds.length} of {diagnosis.findings.length} selected)
-                            </span>
-                          </div>
+                    {/* Findings Metrics & Review Notice */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 font-mono text-xs">
+                      <div className="bg-[#050505] px-3 py-2 rounded border border-[#242820] flex items-center justify-between">
+                        <span className="text-[#969B90] text-[11px]">Ready for Repair</span>
+                        <span className="text-xs font-bold text-[#B7FF3C]">
+                          {diagnosis.findings.filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length}
+                        </span>
+                      </div>
+                      <div className="bg-[#050505] px-3 py-2 rounded border border-[#242820] flex items-center justify-between">
+                        <span className="text-[#969B90] text-[11px]">PRs Tracked</span>
+                        <span className="text-xs font-bold text-[#F4BF50]">
+                          {diagnosis.findings.filter((f) => Boolean(findingPrStatuses[f.id]?.pr_url || findingPrStatuses[f.id]?.pr_number)).length}
+                        </span>
+                      </div>
+                      <div className="bg-[#050505] px-3 py-2 rounded border border-[#242820] flex items-center justify-between">
+                        <span className="text-[#969B90] text-[11px]">Merged Upstream</span>
+                        <span className="text-xs font-bold text-[#C4B5FD]">
+                          {diagnosis.findings.filter((f) => findingPrStatuses[f.id]?.badge_status === 'MERGED').length}
+                        </span>
+                      </div>
+                    </div>
 
-                          <button
-                            type="button"
-                            onClick={() => handleBatchRepair(selectedFindingIds)}
-                            disabled={selectedFindingIds.length === 0 || loading || batchRepairing}
-                            className="px-3.5 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] disabled:opacity-40 text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm flex items-center gap-1.5"
-                          >
-                            {batchRepairing ? (
-                              <>
-                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                <span>Synthesizing Batch...</span>
-                              </>
-                            ) : (
-                              <>
-                                <Sparkles className="w-3.5 h-3.5" />
-                                <span>Repair {selectedFindingIds.length} Selected Finding{selectedFindingIds.length === 1 ? '' : 's'}</span>
-                              </>
-                            )}
-                          </button>
-                        </>
-                      )}
-
-                      {batchMode === 'all' && (
-                        <>
-                          <div className="text-[11px] text-[#969B90]">
-                            Sequentially fixes eligible findings with automatic rollback if test verification fails.
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmAllModalOpen(true)}
-                            disabled={
-                              diagnosis.findings.filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length === 0 ||
-                              loading || batchRepairing
-                            }
-                            className="px-3.5 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] disabled:opacity-40 text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm flex items-center gap-1.5"
-                          >
-                            {batchRepairing ? (
-                              <>
-                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                <span>Processing Batch...</span>
-                              </>
-                            ) : (
-                              <>
-                                <Layers className="w-3.5 h-3.5" />
-                                <span>Review & Repair All ({diagnosis.findings.filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length} Eligible)</span>
-                              </>
-                            )}
-                          </button>
-                        </>
-                      )}
-
-                      {batchMode === 'individual' && (
-                        <div className="text-[11px] text-[#969B90]">
-                          Individual Mode active. Review findings below and click "Synthesize & Apply Scoped Fix" on any finding.
-                        </div>
-                      )}
+                    <div className="p-2.5 bg-[#050505] rounded border border-[#242820] text-[11px] text-[#969B90] leading-relaxed">
+                      Inspect and resolve candidate findings individually below. Each repair synthesizes an isolated patch verified in a sandbox before PR creation.
                     </div>
                   </div>
-
-                  {/* Batch Execution Results Summary Card */}
-                  {batchResult && (
-                    <div className="bg-[#11140F] border border-[#242820] rounded-lg p-3.5 space-y-3">
-                      <div className="flex items-center justify-between border-b border-[#242820] pb-2">
-                        <div className="flex items-center gap-2">
-                          {batchResult.all_succeeded ? (
-                            <CheckCircle2 className="w-4 h-4 text-[#B7FF3C]" />
-                          ) : batchResult.summary.successful > 0 ? (
-                            <AlertTriangle className="w-4 h-4 text-[#F4BF50]" />
-                          ) : (
-                            <XCircle className="w-4 h-4 text-[#FF5C68]" />
-                          )}
-                          <h4 className="text-xs font-mono font-bold uppercase text-[#F4F5F0]">
-                            Batch Execution Summary: {batchResult.all_succeeded ? 'All Verified' : batchResult.summary.successful > 0 ? 'Partial Verification' : 'Execution Failed'}
-                          </h4>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setBatchResult(null)}
-                          className="text-[11px] font-mono text-[#969B90] hover:text-[#F4F5F0]"
-                        >
-                          Dismiss
-                        </button>
-                      </div>
-
-                      {/* Summary Metrics */}
-                      <div className="grid grid-cols-4 gap-2 text-center font-mono">
-                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
-                          <div className="text-[10px] text-[#969B90] uppercase">Total</div>
-                          <div className="text-sm font-bold text-[#F4F5F0]">{batchResult.summary.total}</div>
-                        </div>
-                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
-                          <div className="text-[10px] text-[#B7FF3C] uppercase">Verified</div>
-                          <div className="text-sm font-bold text-[#B7FF3C]">{batchResult.summary.successful}</div>
-                        </div>
-                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
-                          <div className="text-[10px] text-[#FF5C68] uppercase">Failed</div>
-                          <div className="text-sm font-bold text-[#FF5C68]">{batchResult.summary.failed}</div>
-                        </div>
-                        <div className="bg-[#050505] p-2 rounded border border-[#242820]">
-                          <div className="text-[10px] text-[#969B90] uppercase">Skipped</div>
-                          <div className="text-sm font-bold text-[#969B90]">{batchResult.summary.skipped}</div>
-                        </div>
-                      </div>
-
-                      {/* Per-finding status detail */}
-                      <div className="space-y-1.5 pt-1">
-                        {batchResult.results.map((res) => {
-                          const isExpanded = expandedBatchFindingId === res.finding_id;
-                          const isSuccess = res.status === 'verified';
-                          const isFailed = res.status === 'failed' || res.status === 'rolled_back';
-                          return (
-                            <div
-                              key={res.finding_id}
-                              className="bg-[#050505] border border-[#242820] rounded p-2 text-xs font-mono space-y-1.5"
-                            >
-                              <div className="flex items-center justify-between">
-                                <div className="flex items-center gap-2">
-                                  <span
-                                    className={`text-[10px] uppercase px-1.5 py-0.5 rounded font-bold border ${
-                                      isSuccess
-                                        ? 'bg-[#B7FF3C]/10 text-[#B7FF3C] border-[#B7FF3C]/30'
-                                        : isFailed
-                                        ? 'bg-[#FF5C68]/10 text-[#FF5C68] border-[#FF5C68]/30'
-                                        : 'bg-[#242820] text-[#969B90] border-[#3A4034]'
-                                    }`}
-                                  >
-                                    {res.status.toUpperCase()}
-                                  </span>
-                                  <span className="text-[#F4F5F0] font-bold">#{res.finding_id}</span>
-                                  <span className="text-[#969B90] truncate max-w-[280px]">{res.title}</span>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[10px] text-[#969B90]">
-                                    {res.verification_status}
-                                  </span>
-                                  {res.test_details && (
-                                    <button
-                                      type="button"
-                                      onClick={() => setExpandedBatchFindingId(isExpanded ? null : res.finding_id)}
-                                      className="text-[10px] text-[#B7FF3C] hover:underline flex items-center gap-0.5"
-                                    >
-                                      <span>{isExpanded ? 'Hide Log' : 'View Log'}</span>
-                                      <ChevronDown className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-
-                              {res.error && (
-                                <div className="text-[11px] text-[#FF5C68] bg-[#FF5C68]/10 p-1.5 rounded border border-[#FF5C68]/20">
-                                  {res.error}
-                                </div>
-                              )}
-
-                              {isExpanded && res.test_details && (
-                                <div className="mt-2 space-y-1">
-                                  <div className="text-[10px] text-[#969B90] uppercase flex justify-between">
-                                    <span>Exit Code: {res.test_details.returncode}</span>
-                                    <span>{res.test_details.success ? 'Tests Passed' : 'Tests Failed (Rolled Back)'}</span>
-                                  </div>
-                                  <pre className="text-[10px] bg-[#0A0D08] p-2 rounded text-[#969B90] overflow-x-auto max-h-40 whitespace-pre-wrap">
-                                    {res.test_details.stdout || res.test_details.stderr || 'No output recorded'}
-                                  </pre>
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
 
                   {/* Findings Cards List */}
                   <div className="space-y-3">
@@ -2927,7 +2587,6 @@ ${
                       const isMed = finding.severity === 'medium';
                       const prStatus = findingPrStatuses[finding.id];
                       const isEligible = !prStatus || prStatus.is_eligible_for_repair;
-                      const isChecked = selectedFindingIds.includes(finding.id);
 
                       return (
                         <div
@@ -2945,23 +2604,6 @@ ${
                           {/* Finding Header */}
                           <div className="flex items-start justify-between gap-2">
                             <div className="flex items-start gap-2.5">
-                              {/* Selection Checkbox for Batch Mode */}
-                              {batchMode === 'selected' && (
-                                <button
-                                  type="button"
-                                  disabled={!isEligible}
-                                  onClick={() => toggleSelectFinding(finding.id)}
-                                  className="text-[#B7FF3C] disabled:opacity-30 disabled:cursor-not-allowed hover:text-[#D4FF8A] transition-colors pt-0.5 shrink-0"
-                                  title={!isEligible ? (prStatus?.ineligibility_reason || 'Ineligible for batch repair') : (isChecked ? 'Deselect finding' : 'Select finding')}
-                                >
-                                  {isChecked ? (
-                                    <CheckSquare className="w-4 h-4 text-[#B7FF3C]" />
-                                  ) : (
-                                    <Square className="w-4 h-4 text-[#969B90]" />
-                                  )}
-                                </button>
-                              )}
-
                               <div>
                                 <div className="flex flex-wrap items-center gap-1.5 mb-1">
                                   <span className="text-[10px] font-mono text-[#969B90]">#{finding.id}</span>
@@ -2984,6 +2626,11 @@ ${
                                   </span>
 
                                   {/* PR Lifecycle Status Badges */}
+                                  {isEligible && (!prStatus || (!prStatus.pr_url && !prStatus.pr_number)) && (
+                                    <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded font-bold bg-[#1A1F14] text-[#B7FF3C] border border-[#B7FF3C]/30">
+                                      READY FOR REPAIR
+                                    </span>
+                                  )}
                                   {prStatus && prStatus.badge_status === 'MERGED' && prStatus.pr_url && (
                                     <a
                                       href={prStatus.pr_url}
@@ -3098,7 +2745,7 @@ ${
                             ) : (
                               <button
                                 onClick={() => handleRepairFinding(finding)}
-                                disabled={loading || batchRepairing}
+                                disabled={loading}
                                 className="w-full py-2 px-3 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] disabled:opacity-40 text-[#050505] text-xs font-mono font-bold transition-all glow-lime-sm flex items-center justify-center gap-1.5"
                               >
                                 <Sparkles className="w-3.5 h-3.5" />
@@ -3626,108 +3273,6 @@ ${
         </div>
       )}
 
-      {/* Confirmation Modal for Repair All */}
-      {confirmAllModalOpen && diagnosis && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="bg-[#0B0D0A] border border-[#242820] p-6 rounded-lg max-w-lg w-full space-y-4 glow-lime-sm">
-            <div className="flex items-center justify-between border-b border-[#242820] pb-3">
-              <div className="flex items-center gap-2 text-[#F4F5F0]">
-                <Layers className="w-5 h-5 text-[#B7FF3C]" />
-                <h4 className="text-sm font-mono uppercase font-bold">Confirm Batch Repair Execution</h4>
-              </div>
-              <button
-                type="button"
-                onClick={() => setConfirmAllModalOpen(false)}
-                className="text-[#969B90] hover:text-[#F4F5F0]"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs font-mono">
-              <p className="text-[#969B90] leading-relaxed">
-                Patchworks will synthesize targeted patches and run sandbox test verifications sequentially across all eligible findings.
-              </p>
-
-              {/* Eligible Findings */}
-              <div className="p-3 bg-[#11140F] border border-[#B7FF3C]/30 rounded space-y-2">
-                <div className="flex items-center justify-between text-[#B7FF3C] font-bold">
-                  <span>Eligible Findings to Repair:</span>
-                  <span>
-                    {(diagnosis.findings || []).filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair).length}
-                  </span>
-                </div>
-                <div className="max-h-32 overflow-y-auto space-y-1.5 pr-1 text-[11px] text-[#F4F5F0]">
-                  {(diagnosis.findings || [])
-                    .filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair)
-                    .map((f) => (
-                      <div key={f.id} className="flex items-center gap-1.5 truncate">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-[#B7FF3C] shrink-0" />
-                        <span className="text-[#969B90]">#{f.id}</span>
-                        <span className="truncate">{f.title}</span>
-                      </div>
-                    ))}
-                </div>
-              </div>
-
-              {/* Ineligible / Skipped Findings */}
-              {(diagnosis.findings || []).some((f) => findingPrStatuses[f.id] && !findingPrStatuses[f.id].is_eligible_for_repair) && (
-                <div className="p-3 bg-[#050505] border border-[#242820] rounded space-y-2">
-                  <div className="flex items-center justify-between text-[#969B90] font-bold">
-                    <span>Skipped Findings (Already PR'd / Merged):</span>
-                    <span>
-                      {(diagnosis.findings || []).filter((f) => findingPrStatuses[f.id] && !findingPrStatuses[f.id].is_eligible_for_repair).length}
-                    </span>
-                  </div>
-                  <div className="max-h-24 overflow-y-auto space-y-1.5 pr-1 text-[11px] text-[#969B90]">
-                    {(diagnosis.findings || [])
-                      .filter((f) => findingPrStatuses[f.id] && !findingPrStatuses[f.id].is_eligible_for_repair)
-                      .map((f) => {
-                        const pr = findingPrStatuses[f.id];
-                        return (
-                          <div key={f.id} className="flex items-center justify-between text-[11px]">
-                            <span className="truncate max-w-[280px]">#{f.id} {f.title}</span>
-                            <span className="text-[#F4BF50] shrink-0 font-bold">{pr?.badge_status || 'INELIGIBLE'}</span>
-                          </div>
-                        );
-                      })}
-                  </div>
-                </div>
-              )}
-
-              {/* Safeguards Summary */}
-              <div className="p-2.5 bg-[#050505] rounded border border-[#242820] text-[10px] text-[#969B90] leading-relaxed space-y-1">
-                <span className="text-[#B7FF3C] font-semibold block">Execution & Rollback Guarantee:</span>
-                Repairs are serialized with automatic git checkpointing. If any repair causes test failure or patch conflict, its changes are immediately rolled back to the pre-finding checkpoint without corrupting other repairs. Batch repair does not automatically publish PRs.
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setConfirmAllModalOpen(false)}
-                className="px-3 py-1.5 rounded bg-[#11140F] border border-[#242820] text-xs font-mono text-[#969B90] hover:text-[#F4F5F0]"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setConfirmAllModalOpen(false);
-                  const eligibleIds = (diagnosis.findings || [])
-                    .filter((f) => !findingPrStatuses[f.id] || findingPrStatuses[f.id].is_eligible_for_repair)
-                    .map((f) => f.id);
-                  handleBatchRepair(eligibleIds);
-                }}
-                className="px-4 py-1.5 rounded bg-[#B7FF3C] hover:bg-[#D4FF8A] text-[#050505] text-xs font-mono font-bold transition-all glow-lime flex items-center gap-1.5"
-              >
-                <Layers className="w-3.5 h-3.5" />
-                <span>Confirm & Start Batch Repair</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
