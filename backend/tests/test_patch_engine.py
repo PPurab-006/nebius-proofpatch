@@ -68,3 +68,41 @@ def test_fuzzy_apply_patch_with_stripped_indentation():
         assert "guest_token()" not in content
         assert "        return None" in content or "    return None" in content
 
+def test_fuzzy_apply_patch_preserves_nested_indentation_and_strips_json_artifacts():
+    with tempfile.TemporaryDirectory() as temp_repo:
+        os.system(f"cd {temp_repo} && git init && git config user.email 'test@test.com' && git config user.name 'Test'")
+        
+        sample_code = """def resolve_token(user):
+    if user:
+        return user.token
+
+    return None
+"""
+        with open(os.path.join(temp_repo, "service.py"), "w") as f:
+            f.write(sample_code)
+            
+        os.system(f"cd {temp_repo} && git add service.py && git commit -m 'Initial'")
+
+        # Simulated patch with nested block (if not user: return None) and leaked trailing "}, from JSON
+        nested_patch_with_json_leak = """--- a/service.py
++++ b/service.py
+@@ -1,5 +1,6 @@
+ def resolve_token(user):
+-    if user:
+-        return user.token
++    if not user:
++        raise ValueError("Missing")"},
++    return user.token
+"""
+        success = PatchEngine.apply_patch(temp_repo, nested_patch_with_json_leak)
+        assert success is True
+
+        with open(os.path.join(temp_repo, "service.py"), "r") as f:
+            content = f.read()
+
+        # Must compile without SyntaxError or IndentationError
+        compile(content, "service.py", "exec")
+        assert 'raise ValueError("Missing")' in content
+        assert '"},' not in content
+
+

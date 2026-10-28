@@ -386,14 +386,15 @@ class WorkspaceManager:
         elif base_cmd == "pytest":
             try:
                 import pytest  # noqa: F401
-                # Disable conflicting external plugins (e.g. ROS launch_testing) and suppress warning clutter
+                # Disable conflicting external plugins, ignore benchmark fixtures with intentional defects, and suppress warning clutter
                 exec_args = [
                     sys.executable,
                     "-m",
                     "pytest",
                     "-p",
                     "no:launch_testing",
-                    "--disable-warnings"
+                    "--disable-warnings",
+                    "--ignore=benchmark_fixtures"
                 ] + list(cmd_args[1:])
             except ImportError:
                 return {

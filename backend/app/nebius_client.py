@@ -115,13 +115,9 @@ def extract_unified_diff(content: str) -> str:
             if isinstance(data, dict) and "patch" in data and isinstance(data["patch"], str):
                 text = data["patch"].strip()
         except Exception:
-            m = re.search(r'"patch"\s*:\s*"(.*)', text, re.DOTALL)
+            m = re.search(r'"patch"\s*:\s*"((?:\\.|[^"\\])*)', text, re.DOTALL)
             if m:
                 val = m.group(1).rstrip()
-                if val.endswith('"}'):
-                    val = val[:-2]
-                elif val.endswith('"'):
-                    val = val[:-1]
                 try:
                     text = json.loads(f'"{val}"')
                 except Exception:
@@ -161,7 +157,19 @@ def extract_unified_diff(content: str) -> str:
                 break
             if line.startswith("@@"):
                 in_hunk = True
-            diff_lines.append(line)
+
+            cleaned_line = line
+            # Strip trailing JSON escape artifacts like "}, or "} or ", or trailing quote
+            if cleaned_line.endswith('"},'):
+                cleaned_line = cleaned_line[:-3]
+            elif cleaned_line.endswith('"}'):
+                cleaned_line = cleaned_line[:-2]
+            elif cleaned_line.endswith('",'):
+                cleaned_line = cleaned_line[:-2]
+            elif cleaned_line.endswith('"'):
+                cleaned_line = cleaned_line[:-1]
+
+            diff_lines.append(cleaned_line)
         text = "\n".join(diff_lines)
 
     return text.strip() + "\n"

@@ -91,13 +91,31 @@ def fix_hunk_headers(patch: str) -> str:
 
     return "\n".join(fixed_lines) + "\n"
 
+def strip_leaked_json_artifacts(patch: str) -> str:
+    """Strip leaked JSON delimiters like '"},' or '"} ' at the end of diff lines."""
+    cleaned_lines = []
+    for line in patch.splitlines():
+        if line.startswith(("+", "-", " ")):
+            if line.endswith('"},'):
+                line = line[:-3]
+            elif line.endswith('"}'):
+                line = line[:-2]
+            elif line.endswith('",'):
+                line = line[:-2]
+            elif line.endswith('"} '):
+                line = line[:-3]
+            elif line.endswith('", '):
+                line = line[:-3]
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines) + "\n"
+
 class PatchEngine:
     @staticmethod
     def apply_patch(workspace_path: str, patch_content: str) -> bool:
         if not patch_content or not patch_content.strip():
             return False
 
-        sanitized_patch = fix_hunk_headers(normalize_diff_indentation(patch_content))
+        sanitized_patch = strip_leaked_json_artifacts(fix_hunk_headers(normalize_diff_indentation(patch_content)))
         patch_file_path = os.path.join(workspace_path, "repair.patch")
         try:
             with open(patch_file_path, "w") as f:
@@ -270,6 +288,7 @@ class PatchEngine:
 
                 minus_lines = []
                 plus_lines = []
+                plus_raw = []
                 context_before = []
                 context_after = []
                 seen_change = False
@@ -278,13 +297,15 @@ class PatchEngine:
                     if not raw_line:
                         continue
                     prefix = raw_line[0]
-                    val = raw_line[1:].strip()
+                    content_after_prefix = raw_line[1:]
+                    val = content_after_prefix.strip()
                     if not val:
                         continue
                     if prefix == "-":
                         minus_lines.append(val)
                         seen_change = True
                     elif prefix == "+":
+                        plus_raw.append(content_after_prefix)
                         plus_lines.append(val)
                         seen_change = True
                     elif prefix == " ":
@@ -321,7 +342,19 @@ class PatchEngine:
                         match_end = target_indices[found_minus_idx + len(minus_lines) - 1]
                         first_line = target_lines[match_start]
                         base_indent = first_line[:len(first_line) - len(first_line.lstrip())]
-                        new_lines = [f"{base_indent}{val}" for val in plus_lines]
+
+                        # Calculate relative indentation of additions
+                        plus_indents = [len(l) - len(l.lstrip()) for l in plus_raw if l.strip()]
+                        min_indent = min(plus_indents) if plus_indents else 0
+
+                        new_lines = []
+                        for line in plus_raw:
+                            if not line.strip():
+                                new_lines.append("")
+                            else:
+                                cleaned = re.sub(r'[\"\'\}\],]+$', '', line)
+                                rel = cleaned[:len(cleaned) - len(cleaned.lstrip())][min_indent:]
+                                new_lines.append(f"{base_indent}{rel}{cleaned.lstrip()}")
 
                         new_target_lines = target_lines[:match_start] + new_lines + target_lines[match_end + 1:]
                         file_content = "\n".join(new_target_lines)
@@ -346,7 +379,23 @@ class PatchEngine:
                         match_end = target_indices[min(len(target_indices) - 1, best_i + w_len - 1)]
                         first_line = target_lines[match_start]
                         base_indent = first_line[:len(first_line) - len(first_line.lstrip())]
-                        new_lines = [f"{base_indent}{val}" for val in (context_before + plus_lines + context_after)]
+
+                        plus_indents = [len(l) - len(l.lstrip()) for l in plus_raw if l.strip()]
+                        min_indent = min(plus_indents) if plus_indents else 0
+
+                        new_lines = []
+                        for c in context_before:
+                            new_lines.append(f"{base_indent}{c}")
+                        for line in plus_raw:
+                            if not line.strip():
+                                new_lines.append("")
+                            else:
+                                cleaned = re.sub(r'[\"\'\}\],]+$', '', line)
+                                rel = cleaned[:len(cleaned) - len(cleaned.lstrip())][min_indent:]
+                                new_lines.append(f"{base_indent}{rel}{cleaned.lstrip()}")
+                        for c in context_after:
+                            new_lines.append(f"{base_indent}{c}")
+
                         new_target_lines = target_lines[:match_start] + new_lines + target_lines[match_end + 1:]
                         file_content = "\n".join(new_target_lines)
                         file_modified = True
